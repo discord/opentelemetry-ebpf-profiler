@@ -165,16 +165,21 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// TODO: We want to avoid reading static symbols to find the address of r here,
 	// because it would be removed if the binary is stripped, but it seems that's the only
 	// way to get it currently. If possible, we should get it exported in erl_etp.c
+	//
+	// Double hack: when the emulator is built with LTO , the linker renames
+	// file-local symbols by appending a ".llvm.<hash>" suffix, so "r" appears
+	// as e.g. "r.llvm.5915997031394578193". Match either form.
 	var r libpf.Symbol
+	var rFound bool
 	ef.VisitSymbols(func(sym libpf.Symbol) bool {
-		if sym.Name == "r" {
+		if sym.Name == "r" || strings.HasPrefix(string(sym.Name), "r.llvm.") {
 			r = sym
+			rFound = true
 			return false
-		} else {
-			return true
 		}
+		return true
 	})
-	if r.Name != "r" {
+	if !rFound {
 		return nil, fmt.Errorf("symbol 'r' not found")
 	}
 
