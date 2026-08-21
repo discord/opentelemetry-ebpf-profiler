@@ -365,6 +365,10 @@ typedef enum TraceOrigin {
   TRACE_SAMPLING,
   TRACE_OFF_CPU,
   TRACE_PROBE,
+  // Discord: samples synthesized in user space by the beamscope plugin
+  // (interpreter/beamscope) from BEAM shm records. No eBPF program emits
+  // this origin; it exists here so the generated Go constant survives regen.
+  TRACE_BEAMSCOPE,
 } TraceOrigin;
 
 // Maximum number of unique stack deltas needed on a system. This is based on

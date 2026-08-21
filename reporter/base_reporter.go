@@ -51,6 +51,19 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 	case support.TraceOriginSampling:
 	case support.TraceOriginOffCPU:
 	case support.TraceOriginProbe:
+	case support.TraceOriginBeamScope:
+		// Discord (FIX-7): the OTLP/collector aggregation below keys on the
+		// trace hash, which (correctly) excludes beamscope's per-sample num
+		// labels (bin_vheap_delta, mbuf_words, pause_ns, nswitches, ...).
+		// CustomLabels are stored only when a key is first inserted, so every
+		// later sample for that key would silently inherit the first event's
+		// frozen label values. Rather than emit wrong per-sample data, reject
+		// the origin here: beamscope must be paired with the pprof file
+		// reporter (-pprof-dir), which snapshots labels per event. main.go
+		// enforces this at startup; this is the belt-and-suspenders backstop.
+		return fmt.Errorf("beamscope requires the pprof-file reporter "+
+			"(-pprof-dir); the OTLP path freezes per-sample labels: %w",
+			errUnknownOrigin)
 	default:
 		return fmt.Errorf("skip reporting trace for %d origin: %w", meta.Origin,
 			errUnknownOrigin)

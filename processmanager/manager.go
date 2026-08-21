@@ -308,6 +308,7 @@ func hashFrameCacheKey(fk frameCacheKey) uint32 {
 func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace) {
 	meta := &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(times.KTime(bpfTrace.KTime).UnixNano()),
+		KTime:          bpfTrace.KTime,
 		Comm:           bpfTrace.Comm,
 		PID:            bpfTrace.PID,
 		TID:            bpfTrace.TID,

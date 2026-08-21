@@ -148,6 +148,13 @@ func parseArgs() (*controller.Config, error) {
 
 	fs.BoolVar(&args.LoadProbe, "load-probe", false, loadProbeHelper)
 
+	// Discord: local-pprof egress flags; see pprof_egress.go.
+	registerPprofEgressFlags(fs)
+	// Discord: local metrics egress; see metrics_egress.go.
+	registerMetricsEgressFlags(fs)
+	// Discord: beamscope BEAM instrumentation; see beamscope_egress.go.
+	registerBeamscopeEgressFlags(fs)
+
 	fs.Usage = func() {
 		fs.PrintDefaults()
 	}

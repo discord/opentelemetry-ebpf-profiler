@@ -52,6 +52,12 @@ func Start(meter metric.Meter) {
 		if md.Obsolete {
 			continue
 		}
+		// A definition with no field name cannot become an instrument: the OTel
+		// SDK rejects an empty name, and the error is only visible once a real
+		// meter is used instead of the noop one.
+		if md.Field == "" {
+			continue
+		}
 		metricTypes[md.ID] = md.Type
 		switch typ := md.Type; typ {
 		case MetricTypeCounter:

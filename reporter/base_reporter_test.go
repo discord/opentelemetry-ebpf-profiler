@@ -42,6 +42,42 @@ func createTestBaseReporter(t *testing.T, cfg *Config) *baseReporter {
 	}
 }
 
+// TestBaseReporterRejectsBeamScopeOrigin pins FIX-7: the OTLP/collector
+// aggregation keys on the trace hash, which excludes beamscope's per-sample
+// num labels, so accepting the origin here silently freezes those labels at
+// the first event per key. The base reporter must reject it (beamscope is
+// pprof-file-reporter only); a sampling event still reports fine.
+func TestBaseReporterRejectsBeamScopeOrigin(t *testing.T) {
+	reporter := createTestBaseReporter(t, nil)
+
+	trace := &libpf.Trace{
+		Hash: libpf.NewTraceHash(0x1111111100000000, 0x0),
+		Frames: func() libpf.Frames {
+			frames := make(libpf.Frames, 0, 1)
+			frames.Append(&libpf.Frame{
+				Type:         libpf.BEAMFrame,
+				FunctionName: libpf.Intern("MyApp.Worker.run/0"),
+			})
+			return frames
+		}(),
+	}
+	meta := &samples.TraceEventMeta{
+		Timestamp: libpf.UnixTime64(time.Now().UnixNano()),
+		PID:       4242,
+		TID:       4242,
+		Origin:    support.TraceOriginBeamScope,
+	}
+
+	err := reporter.ReportTraceEvent(trace, meta)
+	require.Error(t, err, "base reporter must reject the beamscope origin")
+	require.ErrorIs(t, err, errUnknownOrigin)
+
+	// A normal sampling event is still accepted, so the rejection is scoped to
+	// the beamscope origin only.
+	meta.Origin = support.TraceOriginSampling
+	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
+}
+
 // TestBaseReporterGenerate tests the Generate method and validates the output
 func TestBaseReporterGenerate(t *testing.T) {
 	reporter := createTestBaseReporter(t, nil)

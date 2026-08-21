@@ -8,7 +8,17 @@ import (
 )
 
 type TraceEventMeta struct {
-	Timestamp      libpf.UnixTime64
+	Timestamp libpf.UnixTime64
+	// KTime is the raw kernel timestamp the sample was taken at:
+	// bpf_ktime_get_ns(), CLOCK_MONOTONIC nanoseconds since boot.
+	//
+	// Timestamp above is derived from this by adding a boot-time offset that is
+	// re-estimated periodically, so it carries that estimate's error and can
+	// even reorder two samples across a resync. Consumers that need an exact
+	// stamp, or that correlate against any other kernel-side instrumentation
+	// (perf, sched tracepoints) or against a CLOCK_MONOTONIC reading in the
+	// profiled application, want this one.
+	KTime          int64
 	Comm           libpf.String
 	ProcessName    libpf.String
 	ExecutablePath libpf.String
