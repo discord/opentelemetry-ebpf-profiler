@@ -410,6 +410,19 @@ typedef enum TracePrograms {
   NUM_TRACER_PROGS,
 } TracePrograms;
 
+// TraceOrigin describes the source of the trace. This enables
+// origin specific handling of traces in user space.
+typedef enum TraceOrigin {
+  TRACE_UNKNOWN,
+  TRACE_SAMPLING,
+  TRACE_OFF_CPU,
+  TRACE_PROBE,
+  // Discord: samples synthesized in user space by the beamscope plugin
+  // (interpreter/beamscope) from BEAM shm records. No eBPF program emits
+  // this origin; it exists here so the generated Go constant survives regen.
+  TRACE_BEAMSCOPE,
+} TraceOrigin;
+
 // Maximum number of unique stack deltas needed on a system. This is based on
 // normal desktop /usr/bin/* and /usr/lib/*.so having about 9700 unique deltas.
 // Can be increased up to 2^15, see also STACK_DELTA_COMMAND_FLAG.

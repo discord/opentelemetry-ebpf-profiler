@@ -11,6 +11,8 @@ module go.opentelemetry.io/ebpf-profiler
 go 1.26.0
 
 require (
+ github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3
+ go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.46.0
 	github.com/aws/aws-sdk-go-v2 v1.47.2
 	github.com/aws/aws-sdk-go-v2/config v1.33.8
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.2

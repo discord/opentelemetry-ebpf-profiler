@@ -16,6 +16,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/host"
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
+"go.opentelemetry.io/ebpf-profiler/interpreter/beamscope"
 	"go.opentelemetry.io/ebpf-profiler/libc"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/libpf/pfelf"
@@ -85,7 +86,7 @@ func NewExecutableInfoManager(
 	ebpf pmebpf.EbpfHandler,
 	interpretersConfig interpreterconfig.Config,
 ) (*ExecutableInfoManager, error) {
-	loaders := interpretersConfig.Loaders()
+	loaders := append(interpretersConfig.Loaders(), beamscope.Loader)
 
 	deferredFileIDs, err := lru.NewSynced[host.FileID, libpf.Void](deferredFileIDSize,
 		func(id host.FileID) uint32 { return uint32(id) })

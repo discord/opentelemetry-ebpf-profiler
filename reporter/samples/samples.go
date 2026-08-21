@@ -10,6 +10,10 @@ import (
 )
 
 type TraceEventMeta struct {
+KTime int64
+ProcessName libpf.String
+Origin uint16
+OffTime int64
 	Comm           libpf.Comm
 	ExecutablePath libpf.String
 	ContainerID    libpf.String
