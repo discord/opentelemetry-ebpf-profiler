@@ -120,33 +120,30 @@ func mainWithExitCode() exitCode {
 	// event per key. Fail loud at startup rather than silently emit wrong
 	// per-sample data; the base reporter also rejects the origin as a backstop.
 	//
-	// It is -pprof-dir specifically, NOT "any local egress": the v1 socket wire
-	// format has no field for value/valueKind, erlang_pid_key, or custom labels
-	// of any kind, so -socket-egress alone would start clean and then stream
-	// beamscope samples stripped of every beamscope-specific field -- the
-	// silent-wrong-data path this gate exists to prevent. The two backends stay
-	// independent of each other; this is only about what -beamscope demands.
+	// Either local backend satisfies this: socket wire v2 carries value,
+	// value_kind, erlang_pid_key and typed custom labels, so socket-only is a
+	// complete beamscope capture. What is still not sufficient is OTLP or no
+	// egress at all.
 	if beamscopeEgress.enabled && !beamscopeEgressSupported() {
-		return failure("-beamscope requires the pprof-file egress (-pprof-dir); " +
-			"the OTLP path freezes per-sample beamscope labels, and the v1 socket " +
-			"wire cannot carry value/valueKind, erlang_pid_key or custom labels")
+		return failure("-beamscope requires a local egress (-pprof-dir or " +
+			"-socket-egress); the OTLP path freezes per-sample beamscope labels")
 	}
 
 	// Discord: per-sample Erlang attribution (erlang_pid_key, section 3.9 of
 	// doc/discord-fork.md) is switched on by "-tracers beam" ALONE -- it does
-	// not need -beamscope -- but the label only reaches the pprof-file
-	// backend. The v1 socket wire has no field for it and the OTLP reporter
-	// never emits it, so "-tracers beam -socket-egress" without -pprof-dir
+	// not need -beamscope -- and reaches BOTH local backends: the pprof file
+	// writes it as a numeric label, socket wire v2 as a fixed field. The OTLP
+	// reporter never emits it, so "-tracers beam" with no local egress still
 	// pays the whole attach-time stride probe and then drops every label it
 	// bought. Warn rather than fail: the BEAM tracer is genuinely useful
 	// without the attribution, but the loss must not be silent.
-	if !pprofEgressEnabled() {
+	if !localEgressEnabled() {
 		if it, perr := tracertypes.Parse(cfg.Tracers); perr == nil &&
 			it.Has(tracertypes.BEAMTracer) {
-			log.Warn("the beam tracer is enabled without -pprof-dir: for any " +
-				"BEAM process profiled here, per-sample Erlang attribution (the " +
-				"erlang_pid_key pprof label) is computed and then DROPPED -- " +
-				"neither the v1 socket wire nor the OTLP reporter can carry it")
+			log.Warn("the beam tracer is enabled without a local egress " +
+				"(-pprof-dir or -socket-egress): for any BEAM process profiled " +
+				"here, per-sample Erlang attribution (erlang_pid_key) is " +
+				"computed and then DROPPED -- the OTLP reporter cannot carry it")
 		}
 	}
 

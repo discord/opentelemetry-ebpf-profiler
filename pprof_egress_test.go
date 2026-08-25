@@ -115,13 +115,13 @@ func TestSocketFlagsDocumentTheirDefaults(t *testing.T) {
 	}
 }
 
-// -beamscope demands the pprof-file backend specifically, NOT merely a local
-// egress. The v1 socket wire has no field for a beamscope sample's value /
-// valueKind, its erlang_pid_key, or custom labels of any kind, so
-// "-beamscope -socket-egress" without -pprof-dir would start clean and then
-// stream beamscope samples stripped of every beamscope-specific field. That is
-// silent wrong data, which is exactly what the startup gate exists to refuse.
-func TestBeamscopeRequiresThePprofBackend(t *testing.T) {
+// -beamscope demands a local egress. EITHER backend satisfies it: socket wire
+// v2 carries a beamscope sample's value/value_kind, its erlang_pid_key and its
+// custom labels, which is what makes a socket-only capture complete rather than
+// silently stripped (see TestSocketBeamscopeSampleMatchesPprof, which compares
+// the two backends field for field). What is still refused is no local egress
+// at all, because the OTLP path freezes per-sample labels.
+func TestBeamscopeAcceptsEitherLocalBackend(t *testing.T) {
 	saved := pprofEgress
 	t.Cleanup(func() { pprofEgress = saved })
 
@@ -131,7 +131,7 @@ func TestBeamscopeRequiresThePprofBackend(t *testing.T) {
 		want      bool
 	}{
 		{name: "neither: OTLP freezes per-sample labels", want: false},
-		{name: "socket only: v1 wire carries none of it", sock: "/tmp/s", want: false},
+		{name: "socket only: wire v2 carries all of it", sock: "/tmp/s", want: true},
 		{name: "pprof only", dir: "/tmp/x", want: true},
 		{name: "both", dir: "/tmp/x", sock: "/tmp/s", want: true},
 	} {

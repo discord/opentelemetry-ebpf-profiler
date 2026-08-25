@@ -144,16 +144,13 @@ func pprofEgressEnabled() bool { return pprofEgress.dir != "" }
 func localEgressEnabled() bool { return pprofEgressEnabled() || socketEgressEnabled() }
 
 // beamscopeEgressSupported reports whether the selected egress can actually
-// carry beamscope's per-sample data. Only the pprof-file backend can, so
-// socket-only does NOT satisfy -beamscope even though it is a local egress:
-// socketSink.writeSample serializes ktime/unixNano/offTime/pid/tid/cpu/
-// dropped-delta/comm/pname/exe/cid/origin/flags/frames and nothing else -- the
-// v1 fixed header has no field for value/valueKind (a beamscope sample's own
-// measurement), erlang_pid_key, or custom labels of any kind, and its spare
-// u32 is hardcoded zero. A socket-only -beamscope run would therefore look
-// healthy while streaming beamscope samples stripped of every
-// beamscope-specific field. See doc/discord-fork.md, "What v1 does NOT carry".
-func beamscopeEgressSupported() bool { return pprofEgressEnabled() }
+// carry beamscope's per-sample data. Both local backends can: the socket wire
+// carries value/value_kind, erlang_pid_key and typed custom labels as of
+// version 2, resolved by the same rules the pprof path uses, so a socket-only
+// capture is beamscope-complete rather than silently stripped. What is still
+// not sufficient is no local egress at all -- the OTLP path freezes per-sample
+// beamscope labels.
+func beamscopeEgressSupported() bool { return localEgressEnabled() }
 
 // newLocalEgressReporter builds the local egress reporter. samplesPerSecond must
 // be the tracer's actual rate: it becomes the pprof profile period and the rate
