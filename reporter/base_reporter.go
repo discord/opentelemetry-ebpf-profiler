@@ -58,11 +58,13 @@ func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceE
 		// CustomLabels are stored only when a key is first inserted, so every
 		// later sample for that key would silently inherit the first event's
 		// frozen label values. Rather than emit wrong per-sample data, reject
-		// the origin here: beamscope must be paired with the pprof file
-		// reporter (-pprof-dir), which snapshots labels per event. main.go
-		// enforces this at startup; this is the belt-and-suspenders backstop.
-		return fmt.Errorf("beamscope requires the pprof-file reporter "+
-			"(-pprof-dir); the OTLP path freezes per-sample labels: %w",
+		// the origin here: beamscope must be paired with the local egress's
+		// pprof-file backend (-pprof-dir), which snapshots labels per event.
+		// The socket backend does not substitute -- the v1 wire carries no
+		// custom labels, value/valueKind or erlang_pid_key. main.go enforces
+		// this at startup; this is the belt-and-suspenders backstop.
+		return fmt.Errorf("beamscope requires the local egress's pprof-file "+
+			"backend (-pprof-dir); the OTLP path freezes per-sample labels: %w",
 			errUnknownOrigin)
 	default:
 		return fmt.Errorf("skip reporting trace for %d origin: %w", meta.Origin,

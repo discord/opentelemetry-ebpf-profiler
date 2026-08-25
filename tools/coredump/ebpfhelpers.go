@@ -113,7 +113,12 @@ func __bpf_map_lookup_elem(id C.u64, mapdef unsafe.Pointer, keyptr unsafe.Pointe
 		}
 	case unsafe.Pointer(&C.metrics), unsafe.Pointer(&C.report_events),
 		unsafe.Pointer(&C.reported_pids), unsafe.Pointer(&C.pid_events), unsafe.Pointer(&C.inhibit_events),
-		unsafe.Pointer(&C.apm_int_procs), unsafe.Pointer(&C.go_labels_procs):
+		unsafe.Pointer(&C.apm_int_procs), unsafe.Pointer(&C.go_labels_procs),
+		// beam_sched_tids is looked up from collect_trace on every sample, and
+		// native_tracer_entry is exactly how the coredump harness drives the
+		// unwinder. It is never populated here (there is no sampling instant in
+		// a coredump), so it must miss quietly rather than log per trace.
+		unsafe.Pointer(&C.beam_sched_tids):
 		return unsafe.Pointer(uintptr(0))
 	default:
 		log.Errorf("Map at 0x%x not found", mapdef)

@@ -6,7 +6,7 @@ package beamscope
 // TestEmitRecordedFixturePprof is a gated artifact producer, not an assertion
 // suite: with BEAMSCOPE_EMIT_PPROF=<target.pb.gz> set (and optionally
 // BEAMSCOPE_FIXTURE overriding the recorded segment path), it drains the
-// recorded fixture through the real PprofFileReporter and copies the emitted
+// recorded fixture through the real local-egress reporter and copies the emitted
 // profile to the target path. Used to hand a genuine beamscope pprof artifact
 // to the DST profile-diff toolchain for ingestion validation. Without the env
 // var it skips, so the normal suite is unaffected.

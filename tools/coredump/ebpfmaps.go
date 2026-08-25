@@ -98,6 +98,17 @@ func (emc *ebpfMapsCoredump) DeleteProcData(t libpf.InterpreterType, pid libpf.P
 	return nil
 }
 
+// Per-sample Erlang process attribution is a live-sampling feature: it reads
+// esdp->current_process at the instant a perf interrupt lands. A coredump has
+// no such instant, so the map stays empty here and no label is produced.
+func (emc *ebpfMapsCoredump) UpdateBeamSchedTid(libpf.PID, support.BeamSchedInfo) error {
+	return nil
+}
+
+func (emc *ebpfMapsCoredump) DeleteBeamSchedTid(libpf.PID, libpf.PID) error {
+	return nil
+}
+
 func (emc *ebpfMapsCoredump) UpdatePidInterpreterMapping(pid libpf.PID,
 	prefix lpm.Prefix, interpreterProgram uint8, fileID host.FileID, bias uint64) error {
 	ctx := emc.ctx

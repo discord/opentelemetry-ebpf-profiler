@@ -105,15 +105,19 @@ type Trace struct {
 
 // EbpfTrace represents a stack trace from Ebpf code.
 type EbpfTrace struct {
-	Comm             String
-	ProcessName      String
-	ExecutablePath   String
-	ContainerID      String
-	KTime            int64
-	PID              PID
-	TID              PID
-	Origin           Origin
-	OffTime          int64 // Time a task was off-cpu in nanoseconds.
+	Comm           String
+	ProcessName    String
+	ExecutablePath String
+	ContainerID    String
+	KTime          int64
+	PID            PID
+	TID            PID
+	Origin         Origin
+	OffTime        int64 // Time a task was off-cpu in nanoseconds.
+	// ErlangPidKey is the raw Eterm of the Erlang process the interrupted BEAM
+	// scheduler thread was running, or 0 when the sample is not attributable.
+	// Discord addition; see support/ebpf/beam_sched.h.
+	ErlangPidKey     uint64
 	APMTraceID       APMTraceID
 	APMTransactionID APMTransactionID
 	CPU              int

@@ -16,6 +16,10 @@ extern struct inhibit_events_t inhibit_events;
 extern struct interpreter_offsets_t interpreter_offsets;
 extern struct trace_events_t trace_events;
 extern struct go_labels_procs_t go_labels_procs;
+// beam_sched_tids is read from collect_trace (tracemgmt.h) on every CPU
+// sample, so unlike beam_procs it is needed outside the BEAM unwinder's
+// translation unit.
+extern struct beam_sched_tids_t beam_sched_tids;
 
 #if defined(TESTING_COREDUMP)
 

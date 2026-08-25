@@ -174,6 +174,7 @@ type Trace struct {
 	Num_frames         uint16
 	Origin             uint32
 	Offtime            uint64
+	Erlang_pid_key     uint64
 	Frame_data         [3072]uint64
 }
 type UnwindInfo struct {
@@ -196,6 +197,11 @@ type BEAMProcInfo struct {
 	Frame_pointers_enabled bool
 	Ranges_sizeof          uint8
 	Pad_cgo_0              [6]byte
+}
+type BeamSchedInfo struct {
+	Esdp_addr        uint64
+	Off_current_proc uint32
+	Tgid             uint32
 }
 type DotnetProcInfo struct {
 	Version uint32
@@ -334,7 +340,7 @@ type V8ProcInfo struct {
 
 const (
 	Sizeof_StackDelta = 0x4
-	Sizeof_Trace      = 0x62d0
+	Sizeof_Trace      = 0x62d8
 
 	sizeof_ApmIntProcInfo = 0x8
 	sizeof_DotnetProcInfo = 0x4

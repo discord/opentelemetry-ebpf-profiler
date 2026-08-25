@@ -3,6 +3,7 @@
 #ifndef OPTI_TRACEMGMT_H
 #define OPTI_TRACEMGMT_H
 
+#include "beam_sched.h"
 #include "bpfdefs.h"
 #include "errors.h"
 #include "extmaps.h"
@@ -248,6 +249,10 @@ static inline EBPF_INLINE PerCPURecord *get_pristine_per_cpu_record()
   trace->apm_transaction_id.as_int = 0;
 
   trace->custom_labels.len = 0;
+
+  // Discord: the per-CPU record is reused, so a stale attribution from the
+  // previous sample would be indistinguishable from a fresh one.
+  trace->erlang_pid_key = 0;
 
   return record;
 }
@@ -727,6 +732,15 @@ static inline EBPF_INLINE int collect_trace(
   trace->tid     = tid;
   trace->ktime   = trace_timestamp;
   trace->offtime = off_cpu_time;
+
+  // Discord: per-sample Erlang process attribution. CPU samples only -- an
+  // off-CPU or probe trace is not "what this scheduler is running now", so
+  // stamping current_process on one would be a wrong label rather than a
+  // missing one. The field was zeroed by get_pristine_per_cpu_record above.
+  if (origin == TRACE_SAMPLING) {
+    beam_stamp_current_process(trace, pid, tid);
+  }
+
   if (bpf_get_current_comm(&(trace->comm), sizeof(trace->comm)) < 0) {
     increment_metric(metricID_ErrBPFCurrentComm);
   }

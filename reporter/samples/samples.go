@@ -27,9 +27,33 @@ type TraceEventMeta struct {
 	PID, TID       libpf.PID
 	CPU            int
 	Origin         libpf.Origin
-	OffTime        int64
-	EnvVars        map[libpf.String]libpf.String
+	// OffTime is exclusively the off-CPU sample's off-scheduler nanoseconds.
+	// It is never a generic value channel for other origins (see Value below).
+	OffTime int64
+	// Value and ValueKind are Discord additions: a general per-sample
+	// value channel, distinct from OffTime, used by beamscope-origin samples.
+	// ValueKind says what unit Value is in (see the ValueKind* consts); it is
+	// ValueKindNone for every origin that does not use this channel.
+	Value     int64
+	ValueKind uint8
+	// ErlangPidKey is a Discord addition: the raw Eterm of the Erlang
+	// process a BEAM scheduler thread was running when the CPU sample landed,
+	// or 0 when the sample is not attributable. It is the join key against
+	// beam_scope's JSONL records, so it is carried as an opaque 64-bit value
+	// and never reinterpreted.
+	ErlangPidKey uint64
+	EnvVars      map[libpf.String]libpf.String
 }
+
+// ValueKind* name the units TraceEventMeta.Value can carry. ValueKindNone
+// means the sample does not use this channel (its value, if any, lives
+// elsewhere, e.g. OffTime for off-CPU samples).
+const (
+	ValueKindNone    uint8 = 0
+	ValueKindAlloc   uint8 = 1
+	ValueKindSchedNS uint8 = 2
+	ValueKindMsgs    uint8 = 3
+)
 
 // TraceEvents holds known information about a trace.
 type TraceEvents struct {

@@ -112,16 +112,41 @@ func mainWithExitCode() exitCode {
 		metrics.Start(noop.Meter{})
 	}
 
-	// Discord: with -pprof-dir, egress is local pprof files; see pprof_egress.go.
-	if pprofEgressEnabled() {
-		rep, err := newPprofEgressReporter(int(cfg.SamplesPerSecond))
+	// Discord (FIX-7): beamscope's per-sample num labels are encoded correctly
+	// only by the local egress's pprof-file backend, which snapshots
+	// CustomLabels per event. The OTLP/collector path aggregates on the trace
+	// hash (which excludes those labels) and would freeze them at the first
+	// event per key. Fail loud at startup rather than silently emit wrong
+	// per-sample data; the base reporter also rejects the origin as a backstop.
+	//
+	// It is -pprof-dir specifically, NOT "any local egress": the v1 socket wire
+	// format has no field for value/valueKind, erlang_pid_key, or custom labels
+	// of any kind, so -socket-egress alone would start clean and then stream
+	// beamscope samples stripped of every beamscope-specific field -- the
+	// silent-wrong-data path this gate exists to prevent. The two backends stay
+	// independent of each other; this is only about what -beamscope demands.
+	if beamscopeEgress.enabled && !beamscopeEgressSupported() {
+		return failure("-beamscope requires the pprof-file egress (-pprof-dir); " +
+			"the OTLP path freezes per-sample beamscope labels, and the v1 socket " +
+			"wire cannot carry value/valueKind, erlang_pid_key or custom labels")
+	}
+
+	// Discord: with -pprof-dir and/or -socket-egress, egress is local; see
+	// pprof_egress.go.
+	if localEgressEnabled() {
+		rep, err := newLocalEgressReporter(int(cfg.SamplesPerSecond))
 		if err != nil {
 			log.Error(err)
 			return exitFailure
 		}
 		cfg.Reporter = rep
-		log.Infof("Writing pprof profiles to %s every %s",
-			pprofEgress.dir, pprofEgress.flushInterval)
+		if pprofEgressEnabled() {
+			log.Infof("Writing pprof profiles to %s every %s",
+				pprofEgress.dir, pprofFlushInterval())
+		}
+		if socketEgressEnabled() {
+			log.Infof("Streaming samples to unix socket %s", pprofEgress.socketPath)
+		}
 	} else {
 		rep, err := reporter.NewOTLP(&reporter.Config{
 			Name:                   os.Args[0],
@@ -142,17 +167,6 @@ func mainWithExitCode() exitCode {
 			return exitFailure
 		}
 		cfg.Reporter = rep
-	}
-
-	// Discord (FIX-7): beamscope's per-sample num labels are encoded correctly
-	// only by the pprof file reporter, which snapshots CustomLabels per event.
-	// The OTLP/collector path aggregates on the trace hash (which excludes
-	// those labels) and would freeze them at the first event per key. Fail
-	// loud at startup rather than silently emit wrong per-sample data; the
-	// base reporter also rejects the origin as a backstop.
-	if beamscopeEgress.enabled && !pprofEgressEnabled() {
-		return failure("-beamscope requires -pprof-dir (the pprof-file " +
-			"reporter); the OTLP egress path freezes per-sample beamscope labels")
 	}
 
 	// Discord: with -beamscope, drain BEAM shm instrumentation into the

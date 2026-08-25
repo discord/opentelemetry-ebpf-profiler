@@ -19,6 +19,27 @@ struct beam_procs_t {
   __uint(max_entries, 256);
 } beam_procs SEC(".maps");
 
+// beam_sched_tids maps a kernel tid to the ErtsSchedulerData of the BEAM
+// scheduler thread it is, for per-sample Erlang process attribution
+// (beam_sched.h). Keyed by tid rather than pid because attribution is
+// per-thread; sized for the schedulers of every BEAM on the host (a 128-core
+// box running four VMs at +S 128 needs ~512 normal plus dirty).
+//
+// Unlike beam_procs this map is loaded unconditionally, because collect_trace
+// reads it and collect_trace is inlined into native_tracer_entry, which is
+// always loaded -- a map that only exists when `-tracers beam` is set would
+// make the always-loaded program fail to resolve. BPF_F_NO_PREALLOC keeps
+// that unconditional presence nearly free on the vast majority of hosts,
+// where it stays empty; it is only ever updated from user space, so the
+// non-preallocated allocation path is never taken from a sampling context.
+struct beam_sched_tids_t {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __type(key, u32);
+  __type(value, BeamSchedInfo);
+  __uint(max_entries, 4096);
+  __uint(map_flags, BPF_F_NO_PREALLOC);
+} beam_sched_tids SEC(".maps");
+
 // We assume this Range struct is stable so we can read it all at once directly.
 // If it were to change in the future, we'd need to change the way this struct is read.
 // https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/beam_ranges.c#L31-L34

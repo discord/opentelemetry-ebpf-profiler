@@ -3,11 +3,14 @@
 
 // Discord addition. The two beamscope egress sinks:
 //
-//   - reporterSink turns GC_DELTA records into single-frame BEAM traces on the
-//     existing Reporter.ReportTraceEvent seam with origin TraceOriginBeamScope.
-//     The frame is the process's initial_call (from cached PROC_META), the
-//     sample value (carried in meta.OffTime, the seam's value channel) is
-//     alloc_words, and erlang_pid / bin_vheap_delta ride as custom labels.
+//   - reporterSink turns GC_DELTA/GC_DELTA2/SCHED_DELTA/MSG_FLOW records into
+//     single-frame BEAM traces on the existing Reporter.ReportTraceEvent seam
+//     with origin TraceOriginBeamScope. The frame is the process's
+//     initial_call (from cached PROC_META), the sample value rides
+//     meta.Value/meta.ValueKind (alloc_words, on-scheduler ns, or scaled
+//     message arrivals -- see samples.ValueKind*), and erlang_pid plus
+//     kind-specific extras ride as custom labels. meta.OffTime is NOT used
+//     here any more: it is exclusively the off-CPU sample's value.
 //   - jsonlSink appends every non-GC record as one JSON object per line to a
 //     per-PID file, snake_case fields mirroring the ABI names, ktime_ns and
 //     unix_ns always present.
@@ -40,7 +43,7 @@ import (
 // Custom label keys attached to beamscope samples. Renaming any of them is a
 // breaking change for the offline consumers reading the pprof files. The
 // numeric ones ride CustomLabels as decimal strings and are re-emitted as
-// pprof num labels by the pprof reporter (see beamscopeNumLabelUnits there).
+// pprof num labels by the pprof reporter (see numLabelUnits there).
 var (
 	labelErlangPID     = libpf.Intern("erlang_pid")
 	labelBinVheapDelta = libpf.Intern("bin_vheap_delta")
@@ -50,13 +53,14 @@ var (
 	labelPreempts      = libpf.Intern("preempts")
 	labelYields        = libpf.Intern("yields")
 
-	// labelBeamscopeKind separates the two beamscope sample populations:
-	// "alloc" (GC_DELTA/GC_DELTA2, value = allocated words) and "sched"
-	// (SCHED_DELTA, value = on-scheduler nanoseconds). Present on every
-	// beamscope-origin sample.
+	// labelBeamscopeKind separates the beamscope sample populations: "alloc"
+	// (GC_DELTA/GC_DELTA2, value = allocated words), "sched" (SCHED_DELTA,
+	// value = on-scheduler nanoseconds), and "msg" (MSG_FLOW, value = scaled
+	// arrival count). Present on every beamscope-origin sample.
 	labelBeamscopeKind = libpf.Intern("beamscope_kind")
 	kindAlloc          = libpf.Intern("alloc")
 	kindSched          = libpf.Intern("sched")
+	kindMsg            = libpf.Intern("msg")
 )
 
 // reporterSink converts GC_DELTA records into reporter samples.
@@ -131,7 +135,7 @@ func formatMFA(module, function string, arity uint8) string {
 // frameName renders the display name per the ABI ranking:
 // registered_name > translated MFA > untranslated MFA > pid_printable
 // (then the opaque key when nothing is known). A registered name is used
-// as-is — that is what humans call the process.
+// as-is -- that is what humans call the process.
 func (s *reporterSink) frameName(pidKey uint64) (name, erlangPid string) {
 	m, ok := s.metaCache[pidKey]
 	if !ok {
@@ -154,10 +158,12 @@ func (s *reporterSink) frameName(pidKey uint64) (name, erlangPid string) {
 
 // reportSample synthesizes one single-frame beamscope sample. kind separates
 // the sample populations ("alloc": value = allocated words; "sched": value =
-// on-scheduler nanoseconds); labels are the kind-specific extras — erlang_pid
-// and beamscope_kind are added here.
+// on-scheduler nanoseconds; "msg": value = scaled message arrivals);
+// valueKind is the samples.ValueKind* the value is expressed in; labels are
+// the kind-specific extras -- erlang_pid and beamscope_kind are added here.
 func (s *reporterSink) reportSample(hdr *RecordHeader, pidKey uint64,
-	value int64, kind libpf.String, labels map[libpf.String]libpf.String) {
+	value int64, kind libpf.String, valueKind uint8,
+	labels map[libpf.String]libpf.String) {
 	name, erlangPid := s.frameName(pidKey)
 
 	var frames libpf.Frames
@@ -191,9 +197,8 @@ func (s *reporterSink) reportSample(hdr *RecordHeader, pidKey uint64,
 		PID:            s.pid,
 		TID:            s.pid,
 		Origin:         support.TraceOriginBeamScope,
-		// The seam has no dedicated value field; like off-CPU samples (whose
-		// value is the off time), beamscope samples carry their value here.
-		OffTime: value,
+		Value:          value,
+		ValueKind:      valueKind,
 	}
 
 	if err := s.rep.ReportTraceEvent(trace, meta); err != nil {
@@ -211,6 +216,7 @@ func fmtU64(v uint64) libpf.String { return libpf.Intern(strconv.FormatUint(v, 1
 // for old captures: value = alloc_words, label bin_vheap_delta.
 func (s *reporterSink) handleGCDelta(r *GCDelta) {
 	s.reportSample(&r.RecordHeader, r.PidKey, int64(r.AllocWords), kindAlloc,
+		samples.ValueKindAlloc,
 		map[libpf.String]libpf.String{
 			labelBinVheapDelta: fmtU64(r.BinVheapDeltaWords),
 		})
@@ -220,6 +226,7 @@ func (s *reporterSink) handleGCDelta(r *GCDelta) {
 // shape plus mbuf_words and pause_ns.
 func (s *reporterSink) handleGCDelta2(r *GCDelta2) {
 	s.reportSample(&r.RecordHeader, r.PidKey, int64(r.AllocWords), kindAlloc,
+		samples.ValueKindAlloc,
 		map[libpf.String]libpf.String{
 			labelBinVheapDelta: fmtU64(r.BinVheapDeltaWords),
 			labelMbufWords:     fmtU64(r.MbufWords),
@@ -238,7 +245,19 @@ func (s *reporterSink) handleSchedDelta(r *SchedDelta) {
 		labels[labelPreempts] = fmtU64(uint64(r.Preempts))
 		labels[labelYields] = fmtU64(uint64(r.Yields))
 	}
-	s.reportSample(&r.RecordHeader, r.PidKey, int64(r.OnSchedNS), kindSched, labels)
+	s.reportSample(&r.RecordHeader, r.PidKey, int64(r.OnSchedNS), kindSched,
+		samples.ValueKindSchedNS, labels)
+}
+
+// handleMsgFlow synthesizes one sample per MSG_FLOW (0x0D) record. value is
+// the caller-precomputed scaled arrival estimate: the drainer resolves the
+// RecvSampleShift in force when the record was written (this sink has no
+// access to the ScopeConfig state, which lives on the drainer) and only
+// calls here when a config can support scaling. No kind-specific extras
+// beyond the standard erlang_pid/beamscope_kind pair.
+func (s *reporterSink) handleMsgFlow(r *MsgFlow, value int64) {
+	s.reportSample(&r.RecordHeader, r.PidKey, value, kindMsg,
+		samples.ValueKindMsgs, map[libpf.String]libpf.String{})
 }
 
 // beamTraceHash builds a stable trace hash for the synthesized single-frame
@@ -372,13 +391,20 @@ type drainStatsLine struct {
 	// hit its cap (evicted samples are still reported, with fallback naming).
 	HeldRecords int    `json:"held_records"`
 	HeldEvicted uint64 `json:"held_evicted_total"`
+	// MsgFlowScaleSkipped is the running count of MSG_FLOW records for which
+	// no pprof sample was synthesized because no retained SCOPE_CONFIG that
+	// predates the record could support scaling (see
+	// drainer.resolveRecvShift). Otherwise
+	// unobservable outside a white-box test, same reasoning as HeldEvicted
+	// above.
+	MsgFlowScaleSkipped uint64 `json:"msg_flow_scale_skipped_total"`
 }
 
 // WriteDrainStats appends one drain_stats line. Both clocks are the reader's
 // own (the writer stamps nothing here), captured back to back like the ABI
 // asks of record clocks.
 func (s *jsonlSink) WriteDrainStats(st *DrainStats, heldRecords int,
-	heldEvicted uint64) {
+	heldEvicted uint64, msgFlowScaleSkipped uint64) {
 	if s.path == "" {
 		return
 	}
@@ -398,20 +424,21 @@ func (s *jsonlSink) WriteDrainStats(st *DrainStats, heldRecords int,
 	var ts unix.Timespec
 	_ = unix.ClockGettime(unix.CLOCK_MONOTONIC, &ts)
 	line := drainStatsLine{
-		Type:          "drain_stats",
-		Pid:           s.pid,
-		KTimeNS:       ts.Nano(),
-		UnixNS:        time.Now().UnixNano(),
-		Source:        "reader",
-		DroppedTotal:  st.Dropped,
-		DroppedByRing: droppedByRing,
-		RecordsTotal:  st.Records,
-		PaddingTotal:  st.Padding,
-		UnknownTotal:  st.Unknown,
-		CorruptRings:  st.CorruptRings,
-		NRings:        len(st.DroppedPerRing),
-		HeldRecords:   heldRecords,
-		HeldEvicted:   heldEvicted,
+		Type:                "drain_stats",
+		Pid:                 s.pid,
+		KTimeNS:             ts.Nano(),
+		UnixNS:              time.Now().UnixNano(),
+		Source:              "reader",
+		DroppedTotal:        st.Dropped,
+		DroppedByRing:       droppedByRing,
+		RecordsTotal:        st.Records,
+		PaddingTotal:        st.Padding,
+		UnknownTotal:        st.Unknown,
+		CorruptRings:        st.CorruptRings,
+		NRings:              len(st.DroppedPerRing),
+		HeldRecords:         heldRecords,
+		HeldEvicted:         heldEvicted,
+		MsgFlowScaleSkipped: msgFlowScaleSkipped,
 	}
 
 	s.mu.Lock()

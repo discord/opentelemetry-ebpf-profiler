@@ -30,6 +30,12 @@ const (
 	recTypeGCDelta2     = 0x08
 	recTypeSchedUtil    = 0x09
 	recTypeSchedDelta   = 0x0A
+	recTypeScopeConfig  = 0x0B
+	recTypeVMStat       = 0x0C
+	recTypeMsgFlow      = 0x0D
+	recTypeSenderTopk   = 0x0E
+	recTypePortStat     = 0x0F
+	recTypeEtsStat      = 0x10
 )
 
 // Per-type record flag bits (record header flags field).
@@ -43,7 +49,7 @@ const (
 	procMetaFlagRegisteredName = 1 << 1
 	// procMetaFlagCurrentFunction: module/function/arity is a
 	// current_function snapshot (fallback when there is no translatable
-	// $initial_call) — it names what the process was doing, not how it
+	// $initial_call) -- it names what the process was doing, not how it
 	// started.
 	procMetaFlagCurrentFunction = 1 << 2
 	// schedUtilFlagMsaccValid: the msacc microstate fields carry data (zero
@@ -52,6 +58,22 @@ const (
 	// schedDeltaFlagUnclassified: preempt/yield classification unsupported by
 	// this writer; those counters are zero, nswitches is still valid.
 	schedDeltaFlagUnclassified = 1 << 0
+	// scopeConfigFlagActive: tracing is active in the writer (the config
+	// reflects a live BeamScope.start/1, not a stopped/idle segment).
+	scopeConfigFlagActive = 1 << 0
+	// vmStatFlagMemoryValid: the mem_* fields carry data (zero otherwise, when
+	// the writer's memory sampling is disabled).
+	vmStatFlagMemoryValid = 1 << 0
+	// panelTickFlagDroppedValid: dropped_ticks (payload bytes 12-15, formerly
+	// reserved) carries data. Captures from writers predating the counter have
+	// the flag clear and zeroes in those bytes, so they decode unchanged.
+	panelTickFlagDroppedValid = 1 << 0
+	// portStatFlagDist: the record carries a trailing node_name string (the
+	// port is a distribution port). Absent entirely when clear.
+	portStatFlagDist = 1 << 0
+	// etsStatFlagSweepTruncated: the writer ranked only a subset of ETS tables
+	// for this sweep (e.g. it hit a scan budget), not the full table set.
+	etsStatFlagSweepTruncated = 1 << 0
 )
 
 // recordHeaderSize is the fixed record header: len u16, type u16, flags u32,
@@ -174,10 +196,14 @@ func (*MonitorEvent) TypeName() string { return "monitor_event" }
 // PanelTick (0x07): one per Panel tick; delimits epochs.
 type PanelTick struct {
 	RecordHeader
-	Epoch        uint32 `json:"epoch"`
-	PanelSize    uint32 `json:"panel_size"`
-	WatchSize    uint32 `json:"watch_size"`
-	Reserved     uint32 `json:"-"`
+	Epoch     uint32 `json:"epoch"`
+	PanelSize uint32 `json:"panel_size"`
+	WatchSize uint32 `json:"watch_size"`
+	// DroppedTicks counts Panel ticks the writer skipped, and is meaningful
+	// only when DroppedValid: a zero with the flag clear means "this writer
+	// does not report it", not "none were dropped".
+	DroppedTicks uint32 `json:"dropped_ticks"`
+	DroppedValid bool   `json:"dropped_valid"`
 	ProcessCount uint64 `json:"process_count"`
 }
 
@@ -235,6 +261,150 @@ type SchedDelta struct {
 }
 
 func (*SchedDelta) TypeName() string { return "sched_delta" }
+
+// ScopeConfig (0x0B): the writer's live sampling/config knobs, re-emitted
+// whenever they change. Six payload lengths are in the wild (36, 40, 48, 60,
+// 64, 72 bytes); a longer payload from a newer writer is decoded the same as
+// 72 and any bytes past offset 72 are future fields this reader does not know
+// about yet (tolerated, never read). PayloadLen lets a consumer distinguish a
+// field that is genuinely 0 from one absent at this writer's length -- e.g.
+// TickMS == 0 with PayloadLen == 36 means "this writer never had a tick_ms
+// field", not "tick_ms is known to be zero".
+type ScopeConfig struct {
+	RecordHeader
+	// SendSampleShift: send-side sample-rate shift; >= 63 means send sampling
+	// is disabled.
+	SendSampleShift  uint32 `json:"send_sample_shift"`
+	GCThresholdWords uint64 `json:"gc_threshold_words"`
+	SchedThresholdNS uint64 `json:"sched_threshold_ns"`
+	SketchCapacity   uint32 `json:"sketch_capacity"`
+	MirrorCapacity   uint32 `json:"mirror_capacity"`
+	TopkK            uint32 `json:"topk_k"`
+	// MemoryEvery: 0 means unknown (also the zero value when absent at
+	// PayloadLen == 36, which ends exactly at this field).
+	MemoryEvery uint32 `json:"memory_every"`
+	// TickMS: 0 means unknown/no panel; also the zero value when absent at
+	// PayloadLen < 40.
+	TickMS uint32 `json:"tick_ms"`
+	// RecvSampleShift: >= 63 means receive tracing is disabled; also the zero
+	// value when absent at PayloadLen < 48.
+	RecvSampleShift   uint32 `json:"recv_sample_shift"`
+	RecvEmitThreshold uint32 `json:"recv_emit_threshold"`
+	// SenderSampleShift: >= 63 means SENDER_TOPK sampling is disabled; also
+	// the zero value when absent at PayloadLen < 60. Distinct from
+	// SendSampleShift (TOPK_SEND, 0x05) -- these are two independently
+	// configured sketches.
+	SenderSampleShift uint32 `json:"sender_sample_shift"`
+	// SenderTopkK: 0 means SENDER_TOPK is off; also the zero value when
+	// absent at PayloadLen < 60.
+	SenderTopkK uint32 `json:"sender_topk_k"`
+	// WatchSetSize: also the zero value when absent at PayloadLen < 60.
+	WatchSetSize uint32 `json:"watch_set_size"`
+	// PortTopN: 0 means PORT_STAT is off; also the zero value when absent at
+	// PayloadLen < 64.
+	PortTopN uint32 `json:"port_top_n"`
+	// EtsTopN: 0 means ETS_STAT is off; also the zero value when absent at
+	// PayloadLen < 72.
+	EtsTopN uint32 `json:"ets_top_n"`
+	// EtsEvery: 0 means off/unknown; also the zero value when absent at
+	// PayloadLen < 72.
+	EtsEvery uint32 `json:"ets_every"`
+	// Active (flags bit0): tracing is active in the writer.
+	Active bool `json:"active"`
+	// PayloadLen is the number of payload bytes actually present in this
+	// record (36, 40, 48, 60, 64, or 72 for known writers so far; may be
+	// larger for a future writer whose extra fields this reader does not
+	// decode).
+	PayloadLen int `json:"payload_len"`
+}
+
+func (*ScopeConfig) TypeName() string { return "scope_config" }
+
+// VMStat (0x0C): one whole-VM statistics snapshot per Panel tick.
+type VMStat struct {
+	RecordHeader
+	ContextSwitches uint64 `json:"context_switches"` // cumulative
+	RunQueueTotal   uint64 `json:"run_queue_total"`  // instantaneous
+	IOInBytes       uint64 `json:"io_in_bytes"`      // cumulative
+	IOOutBytes      uint64 `json:"io_out_bytes"`     // cumulative
+	Reductions      uint64 `json:"reductions"`       // cumulative
+	AtomCount       uint32 `json:"atom_count"`
+	PortCount       uint32 `json:"port_count"`
+	// MemTotal/MemProcesses/MemBinary/MemEts are zero unless MemoryValid.
+	MemTotal     uint64 `json:"mem_total"`
+	MemProcesses uint64 `json:"mem_processes"`
+	MemBinary    uint64 `json:"mem_binary"`
+	MemEts       uint64 `json:"mem_ets"`
+	Epoch        uint32 `json:"epoch"`
+	// MemoryValid (flags bit0): the mem_* fields carry data.
+	MemoryValid bool `json:"memory_valid"`
+}
+
+func (*VMStat) TypeName() string { return "vm_stat" }
+
+// MsgFlow (0x0D): one send-arrival-rate sample for a destination pid_key.
+// ArrivalsRaw is a raw sampled count; scale by 2^RecvSampleShift from the
+// drainer's latestConfig to get the estimated true arrival count.
+type MsgFlow struct {
+	RecordHeader
+	PidKey      uint64 `json:"pid_key"`
+	ArrivalsRaw uint64 `json:"arrivals_raw"`
+}
+
+func (*MsgFlow) TypeName() string { return "msg_flow" }
+
+// SenderTopk (0x0E): one entry of the send-side heavy-hitter sketch keyed by
+// (dest, sender) pair, distinguishing this from TOPK_SEND (0x05) which is
+// keyed by destination alone. EstArrivals is raw; scale by
+// 2^SenderSampleShift (ScopeConfig) to get the estimated true count -- this
+// reader does not perform that scaling, unlike MsgFlow's pprof path.
+type SenderTopk struct {
+	RecordHeader
+	DestPidKey   uint64 `json:"dest_pid_key"`
+	SenderPidKey uint64 `json:"sender_pid_key"`
+	EstArrivals  uint64 `json:"est_arrivals"`
+	// Epoch carries the same TOPK_SEND-style E vs E+1 skew as TopkSend;
+	// decoded verbatim, not reconciled here.
+	Epoch uint32 `json:"epoch"`
+	Rank  uint8  `json:"rank"` // 0 = hottest
+}
+
+func (*SenderTopk) TypeName() string { return "sender_topk" }
+
+// PortStat (0x0F): one entry of the per-port ranking (e.g. by queue size).
+type PortStat struct {
+	RecordHeader
+	PortKey        uint64 `json:"port_key"`
+	QueueSizeBytes uint64 `json:"queue_size_bytes"`
+	// ConnectedPidKey: 0 means the connected process is gone.
+	ConnectedPidKey uint64 `json:"connected_pid_key"`
+	Epoch           uint32 `json:"epoch"`
+	Rank            uint8  `json:"rank"` // 0 = hottest
+	DriverName      string `json:"driver_name"`
+	PortPrintable   string `json:"port_printable"`
+	// NodeName (flags bit0/Dist): present only for a distribution port.
+	NodeName string `json:"node_name,omitempty"`
+	// Dist (flags bit0): this is a distribution port; NodeName is present.
+	Dist bool `json:"dist"`
+}
+
+func (*PortStat) TypeName() string { return "port_stat" }
+
+// EtsStat (0x10): one entry of the per-ETS-table ranking (e.g. by memory).
+type EtsStat struct {
+	RecordHeader
+	OwnerPidKey uint64 `json:"owner_pid_key"`
+	MemoryWords uint64 `json:"memory_words"`
+	SizeObjects uint64 `json:"size_objects"`
+	Epoch       uint32 `json:"epoch"`
+	Rank        uint8  `json:"rank"` // 0 = hottest
+	Name        string `json:"name"`
+	// SweepTruncated (flags bit0): the writer ranked only a subset of ETS
+	// tables for this sweep, not the full table set.
+	SweepTruncated bool `json:"sweep_truncated"`
+}
+
+func (*EtsStat) TypeName() string { return "ets_stat" }
 
 // cursor is a bounds-checked sequential reader over a record payload.
 type cursor struct {
@@ -380,7 +550,8 @@ func decodeRecord(rec []byte) (Record, error) {
 			Epoch:        c.u32(),
 			PanelSize:    c.u32(),
 			WatchSize:    c.u32(),
-			Reserved:     c.u32(),
+			DroppedTicks: c.u32(),
+			DroppedValid: hdr.Flags&panelTickFlagDroppedValid != 0,
 			ProcessCount: c.u64(),
 		}
 	case recTypeGCDelta2:
@@ -419,6 +590,103 @@ func decodeRecord(rec []byte) (Record, error) {
 			Yields:                    c.u32(),
 			Reserved:                  c.u32(),
 			ClassificationUnsupported: hdr.Flags&schedDeltaFlagUnclassified != 0,
+		}
+	case recTypeScopeConfig:
+		// payloadLen drives the absent-field convention: fields past what this
+		// writer's length covers are never read (they stay Go zero values),
+		// and a payload shorter than the oldest known shape is truncated via
+		// the cursor's own bounds check below, same as every other type.
+		payloadLen := len(rec) - recordHeaderSize
+		sc := &ScopeConfig{
+			RecordHeader:     hdr,
+			PayloadLen:       payloadLen,
+			SendSampleShift:  c.u32(),
+			GCThresholdWords: c.u64(),
+			SchedThresholdNS: c.u64(),
+			SketchCapacity:   c.u32(),
+			MirrorCapacity:   c.u32(),
+			TopkK:            c.u32(),
+			MemoryEvery:      c.u32(),
+			Active:           hdr.Flags&scopeConfigFlagActive != 0,
+		}
+		if payloadLen >= 40 {
+			sc.TickMS = c.u32()
+		}
+		if payloadLen >= 48 {
+			sc.RecvSampleShift = c.u32()
+			sc.RecvEmitThreshold = c.u32()
+		}
+		if payloadLen >= 60 {
+			sc.SenderSampleShift = c.u32()
+			sc.SenderTopkK = c.u32()
+			sc.WatchSetSize = c.u32()
+		}
+		if payloadLen >= 64 {
+			sc.PortTopN = c.u32()
+		}
+		if payloadLen >= 72 {
+			sc.EtsTopN = c.u32()
+			sc.EtsEvery = c.u32()
+		}
+		out = sc
+	case recTypeVMStat:
+		out = &VMStat{
+			RecordHeader:    hdr,
+			ContextSwitches: c.u64(),
+			RunQueueTotal:   c.u64(),
+			IOInBytes:       c.u64(),
+			IOOutBytes:      c.u64(),
+			Reductions:      c.u64(),
+			AtomCount:       c.u32(),
+			PortCount:       c.u32(),
+			MemTotal:        c.u64(),
+			MemProcesses:    c.u64(),
+			MemBinary:       c.u64(),
+			MemEts:          c.u64(),
+			Epoch:           c.u32(),
+			MemoryValid:     hdr.Flags&vmStatFlagMemoryValid != 0,
+		}
+	case recTypeMsgFlow:
+		out = &MsgFlow{
+			RecordHeader: hdr,
+			PidKey:       c.u64(),
+			ArrivalsRaw:  c.u64(),
+		}
+	case recTypeSenderTopk:
+		out = &SenderTopk{
+			RecordHeader: hdr,
+			DestPidKey:   c.u64(),
+			SenderPidKey: c.u64(),
+			EstArrivals:  c.u64(),
+			Epoch:        c.u32(),
+			Rank:         c.u8(),
+		}
+	case recTypePortStat:
+		ps := &PortStat{
+			RecordHeader:    hdr,
+			PortKey:         c.u64(),
+			QueueSizeBytes:  c.u64(),
+			ConnectedPidKey: c.u64(),
+			Epoch:           c.u32(),
+			Rank:            c.u8(),
+			DriverName:      c.str(),
+			PortPrintable:   c.str(),
+			Dist:            hdr.Flags&portStatFlagDist != 0,
+		}
+		if ps.Dist {
+			ps.NodeName = c.str()
+		}
+		out = ps
+	case recTypeEtsStat:
+		out = &EtsStat{
+			RecordHeader:   hdr,
+			OwnerPidKey:    c.u64(),
+			MemoryWords:    c.u64(),
+			SizeObjects:    c.u64(),
+			Epoch:          c.u32(),
+			Rank:           c.u8(),
+			Name:           c.str(),
+			SweepTruncated: hdr.Flags&etsStatFlagSweepTruncated != 0,
 		}
 	default:
 		return nil, fmt.Errorf("%w: 0x%02x", errUnknownRecordType, hdr.Type)

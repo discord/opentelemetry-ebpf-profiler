@@ -97,7 +97,7 @@ func TestLineageBoundsTheWalk(t *testing.T) {
 func TestPprofFileReporterWritesLineageLabels(t *testing.T) {
 	root := fakeProcFS(t, map[int]int{1: 0, 100: 1, 200: 100}, nil)
 	dir := t.TempDir()
-	r, err := NewPprofFile(PprofFileConfig{Dir: dir, SamplesPerSecond: 100, ProcFS: root})
+	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100, ProcFS: root})
 	require.NoError(t, err)
 	require.NoError(t, r.ReportTraceEvent(testTrace(t, "a", "b"),
 		meta(1, 200, 201, "worker", "beam.smp", "cid")))
@@ -113,7 +113,7 @@ func TestPprofFileReporterWritesLineageLabels(t *testing.T) {
 // ancestry-based number instead of trusting it blindly.
 func TestPprofFileReporterReportsUnresolvedLineage(t *testing.T) {
 	dir := t.TempDir()
-	r, err := NewPprofFile(PprofFileConfig{Dir: dir, SamplesPerSecond: 100, ProcFS: t.TempDir()})
+	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100, ProcFS: t.TempDir()})
 	require.NoError(t, err)
 	require.NoError(t, r.ReportTraceEvent(testTrace(t, "a"), meta(1, 4242, 4242, "c", "p", "k")))
 	require.NoError(t, r.Flush())

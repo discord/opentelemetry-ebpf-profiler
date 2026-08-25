@@ -535,6 +535,25 @@ typedef struct BEAMProcInfo {
   u8 ranges_sizeof;
 } BEAMProcInfo;
 
+// BeamSchedInfo is the per-scheduler-thread data needed to attribute a CPU
+// sample to the Erlang process the scheduler is running. It is keyed by kernel
+// tid, so one entry exists per BEAM scheduler thread on the host.
+//
+// esdp_addr is the already-biased address of this thread's ErtsSchedulerData
+// (i.e. &erts_aligned_scheduler_data[no-1], or the dirty-CPU array's
+// equivalent); off_current_proc is offsetof(ErtsSchedulerData,
+// current_process). Both are resolved and validated in user space before the
+// entry is written -- see interpreter/beam/beam_sched.go -- so the eBPF side
+// never has to reason about OTP versions.
+//
+// tgid is the BEAM process the entry was written for. See beam_sched.h's
+// identity section for why the map value must be bound to it.
+typedef struct BeamSchedInfo {
+  u64 esdp_addr;
+  u32 off_current_proc;
+  u32 tgid;
+} BeamSchedInfo;
+
 // COMM_LEN defines the maximum length we will receive for the comm of a task.
 #define COMM_LEN 16
 
@@ -617,6 +636,13 @@ typedef struct Trace {
 
   // offtime stores the nanoseconds that the trace was off-cpu for.
   u64 offtime;
+
+  // erlang_pid_key is the raw Eterm of the Erlang process the interrupted BEAM
+  // scheduler thread was running, or 0 when the sample is not attributable
+  // (not a scheduler thread, unsupported VM, scheduler between processes, or
+  // the read failed the pid tag check). Discord addition; see
+  // beam_sched.h and doc/discord-fork.md.
+  u64 erlang_pid_key;
 
   // The frame data of the stack trace. Each frame is variable length.
   // Frame is currently 2-3 entries long. This array size limits the

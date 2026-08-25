@@ -1098,6 +1098,7 @@ func (t *Tracer) loadBpfTrace(raw []byte, cpu int) (*libpf.EbpfTrace, error) {
 		TID:              libpf.PID(ptr.Tid),
 		Origin:           libpf.Origin(ptr.Origin),
 		OffTime:          int64(ptr.Offtime),
+		ErlangPidKey:     ptr.Erlang_pid_key,
 		KTime:            int64(ptr.Ktime),
 		CPU:              cpu,
 		EnvVars:          procMeta.EnvVariables,

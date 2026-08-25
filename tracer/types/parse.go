@@ -74,6 +74,12 @@ func IsMapEnabled(mapName string, includeTracers IncludedTracers) bool {
 		// go_labels_procs and apm_int_procs are called from
 		// unwind_stop and therefore need to be available all the time.
 		return true
+	case "beam_sched_tids":
+		// Discord: read from collect_trace, which is inlined into the
+		// always-loaded native_tracer_entry, so it must exist even when the
+		// BEAM tracer is off or that program cannot resolve its maps. It is
+		// BPF_F_NO_PREALLOC and stays empty on non-BEAM hosts.
+		return true
 	default:
 		return true // Not an interpreter map, so it should be loaded
 	}

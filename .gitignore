@@ -5,6 +5,8 @@
 /.idea
 /go
 ebpf-profiler
+ebpf-profiler-socket
+.fsf-pin-verified-*
 ci-kernels
 # Ignore target directory
 target/*

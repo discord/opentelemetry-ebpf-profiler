@@ -114,6 +114,38 @@ func TestDecodeGolden(t *testing.T) {
 			},
 		},
 		{
+			// Payload bytes 12-15 used to be discarded as Reserved; the
+			// producer now writes dropped_ticks there, valid when flags bit0
+			// is set. A pre-bit0 capture keeps decoding as DroppedValid=false.
+			name: "panel_tick_dropped",
+			raw:  encPanelTickDropped(tK, tU, 43, 1000, 64, 350_001, 17, true),
+			want: &PanelTick{
+				RecordHeader: RecordHeader{Len: 48, Type: recTypePanelTick,
+					Flags: panelTickFlagDroppedValid, KTimeNS: tK, UnixNS: tU},
+				Epoch:        43,
+				PanelSize:    1000,
+				WatchSize:    64,
+				DroppedTicks: 17,
+				DroppedValid: true,
+				ProcessCount: 350_001,
+			},
+		},
+		{
+			// dropped_ticks present in the bytes but the flag clear: the
+			// value is not trustworthy, so it must not be surfaced as valid.
+			name: "panel_tick_dropped_flag_clear",
+			raw:  encPanelTickDropped(tK, tU, 44, 1000, 64, 350_002, 17, false),
+			want: &PanelTick{
+				RecordHeader: hdr(recTypePanelTick, 48),
+				Epoch:        44,
+				PanelSize:    1000,
+				WatchSize:    64,
+				DroppedTicks: 17,
+				DroppedValid: false,
+				ProcessCount: 350_002,
+			},
+		},
+		{
 			name: "gc_delta2",
 			// payload 6*8+1 = 49 -> record 73 -> 80
 			raw: encGCDelta2(tK, tU, 0xbeef2, 40_000, 512, 1_024, 121_393, 250_000, 1),
@@ -230,6 +262,134 @@ func TestDecodeGolden(t *testing.T) {
 			},
 		},
 		{
+			name: "vm_stat",
+			raw: encVMStat(vmStatFlagMemoryValid, tK, tU,
+				1_234_567, 8, 999_000, 111_000, 50_000_000, 4096, 64,
+				100_000_000, 60_000_000, 20_000_000, 15_000_000, 99),
+			want: &VMStat{
+				RecordHeader: RecordHeader{Len: 112, Type: recTypeVMStat,
+					Flags: vmStatFlagMemoryValid, KTimeNS: tK, UnixNS: tU},
+				ContextSwitches: 1_234_567,
+				RunQueueTotal:   8,
+				IOInBytes:       999_000,
+				IOOutBytes:      111_000,
+				Reductions:      50_000_000,
+				AtomCount:       4096,
+				PortCount:       64,
+				MemTotal:        100_000_000,
+				MemProcesses:    60_000_000,
+				MemBinary:       20_000_000,
+				MemEts:          15_000_000,
+				Epoch:           99,
+				MemoryValid:     true,
+			},
+		},
+		{
+			name: "vm_stat_memory_invalid",
+			// flags bit0 clear: mem_* fields are zero (writer's convention),
+			// not decoder-injected -- the encoded bytes really are zero here.
+			raw: encVMStat(0, tK, tU,
+				1_234_567, 8, 999_000, 111_000, 50_000_000, 4096, 64,
+				0, 0, 0, 0, 99),
+			want: &VMStat{
+				RecordHeader:    hdr(recTypeVMStat, 112),
+				ContextSwitches: 1_234_567,
+				RunQueueTotal:   8,
+				IOInBytes:       999_000,
+				IOOutBytes:      111_000,
+				Reductions:      50_000_000,
+				AtomCount:       4096,
+				PortCount:       64,
+				Epoch:           99,
+				MemoryValid:     false,
+			},
+		},
+		{
+			name: "msg_flow",
+			raw:  encMsgFlow(tK, tU, 0x2222, 777),
+			want: &MsgFlow{
+				RecordHeader: hdr(recTypeMsgFlow, 40),
+				PidKey:       0x2222,
+				ArrivalsRaw:  777,
+			},
+		},
+		{
+			name: "sender_topk",
+			// payload 8+8+8+4+1 = 29 -> record 53 -> 56
+			raw: encSenderTopk(tK, tU, 0x1111, 0x2222, 500_000, 7, 2),
+			want: &SenderTopk{
+				RecordHeader: hdr(recTypeSenderTopk, 56),
+				DestPidKey:   0x1111,
+				SenderPidKey: 0x2222,
+				EstArrivals:  500_000,
+				Epoch:        7,
+				Rank:         2,
+			},
+		},
+		{
+			name: "port_stat_no_dist",
+			raw: encPortStat(tK, tU, 0xf00, 4096, 0xbeef, 3, 0,
+				"tcp_inet", "#Port<0.7>", false, ""),
+			want: &PortStat{
+				RecordHeader:    hdr(recTypePortStat, 80),
+				PortKey:         0xf00,
+				QueueSizeBytes:  4096,
+				ConnectedPidKey: 0xbeef,
+				Epoch:           3,
+				Rank:            0,
+				DriverName:      "tcp_inet",
+				PortPrintable:   "#Port<0.7>",
+			},
+		},
+		{
+			name: "port_stat_dist",
+			raw: encPortStat(tK, tU, 0xf01, 8192, 0, 4, 1,
+				"tcp_inet", "#Port<0.8>", true, "node2@host"),
+			want: &PortStat{
+				RecordHeader: RecordHeader{
+					Len: 88, Type: recTypePortStat,
+					Flags: portStatFlagDist, KTimeNS: tK, UnixNS: tU},
+				PortKey:         0xf01,
+				QueueSizeBytes:  8192,
+				ConnectedPidKey: 0, // connected process gone
+				Epoch:           4,
+				Rank:            1,
+				DriverName:      "tcp_inet",
+				PortPrintable:   "#Port<0.8>",
+				NodeName:        "node2@host",
+				Dist:            true,
+			},
+		},
+		{
+			name: "ets_stat",
+			raw:  encEtsStat(tK, tU, 0xd00d, 2048, 100, 5, 0, "my_table", false),
+			want: &EtsStat{
+				RecordHeader: hdr(recTypeEtsStat, 64),
+				OwnerPidKey:  0xd00d,
+				MemoryWords:  2048,
+				SizeObjects:  100,
+				Epoch:        5,
+				Rank:         0,
+				Name:         "my_table",
+			},
+		},
+		{
+			name: "ets_stat_sweep_truncated",
+			raw:  encEtsStat(tK, tU, 0xd00e, 4096, 200, 6, 1, "big_table", true),
+			want: &EtsStat{
+				RecordHeader: RecordHeader{
+					Len: 64, Type: recTypeEtsStat,
+					Flags: etsStatFlagSweepTruncated, KTimeNS: tK, UnixNS: tU},
+				OwnerPidKey:    0xd00e,
+				MemoryWords:    4096,
+				SizeObjects:    200,
+				Epoch:          6,
+				Rank:           1,
+				Name:           "big_table",
+				SweepTruncated: true,
+			},
+		},
+		{
 			name: "proc_meta_current_function",
 			// bit2: the MFA names what the process was doing, not how it
 			// started; here with bit1 too, exercising both appended strings.
@@ -331,6 +491,217 @@ func BenchmarkDecodeRecord(b *testing.B) {
 		if _, err := decodeRecord(pm); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// TestDecodeScopeConfigLengths pins the three known SCOPE_CONFIG payload
+// lengths (36, 40, 48) and the absent-field convention: a field past the
+// writer's length decodes as the Go zero value AND PayloadLen says so, so a
+// consumer can tell "0" from "this writer never had the field". These are
+// kept out of TestDecodeGolden because encScopeConfig(36, ...) deliberately
+// builds a non-8-aligned total record length (60 bytes) to make length 36
+// distinguishable on the wire from length 40 with tick_ms == 0 -- see
+// encScopeConfig's doc comment -- and the golden table asserts 8-byte
+// alignment on every fixture.
+func TestDecodeScopeConfigLengths(t *testing.T) {
+	tests := []struct {
+		name       string
+		payloadLen int
+		flags      uint32
+		wantRecLen int
+		// want is nil for the truncated case: decodeRecord must return
+		// errTruncatedRecord instead of a decoded value.
+		want *ScopeConfig
+	}{
+		{
+			name:       "length_36_oldest_writer",
+			payloadLen: 36,
+			flags:      0,
+			wantRecLen: 60,
+			want: &ScopeConfig{
+				RecordHeader:     hdr(recTypeScopeConfig, 60),
+				SendSampleShift:  10,
+				GCThresholdWords: 40_000,
+				SchedThresholdNS: 2_000_000,
+				SketchCapacity:   8192,
+				MirrorCapacity:   4096,
+				TopkK:            16,
+				MemoryEvery:      5000,
+				// TickMS, RecvSampleShift, RecvEmitThreshold,
+				// SenderSampleShift, SenderTopkK, WatchSetSize, PortTopN,
+				// EtsTopN, EtsEvery: absent -> zero, even though nonzero
+				// bytes were passed to the encoder for them.
+				PayloadLen: 36,
+			},
+		},
+		{
+			name:       "length_40_adds_tick_ms",
+			payloadLen: 40,
+			flags:      0,
+			wantRecLen: 64,
+			want: &ScopeConfig{
+				RecordHeader:     hdr(recTypeScopeConfig, 64),
+				SendSampleShift:  10,
+				GCThresholdWords: 40_000,
+				SchedThresholdNS: 2_000_000,
+				SketchCapacity:   8192,
+				MirrorCapacity:   4096,
+				TopkK:            16,
+				MemoryEvery:      5000,
+				TickMS:           250,
+				// RecvSampleShift, RecvEmitThreshold, SenderSampleShift,
+				// SenderTopkK, WatchSetSize, PortTopN, EtsTopN, EtsEvery:
+				// still absent -> zero.
+				PayloadLen: 40,
+			},
+		},
+		{
+			name:       "length_48_newest_writer_active",
+			payloadLen: 48,
+			flags:      scopeConfigFlagActive,
+			wantRecLen: 72,
+			want: &ScopeConfig{
+				RecordHeader: RecordHeader{Len: 72, Type: recTypeScopeConfig,
+					Flags: scopeConfigFlagActive, KTimeNS: tK, UnixNS: tU},
+				SendSampleShift:   63, // >= 63: send sampling disabled
+				GCThresholdWords:  40_000,
+				SchedThresholdNS:  2_000_000,
+				SketchCapacity:    8192,
+				MirrorCapacity:    4096,
+				TopkK:             16,
+				MemoryEvery:       5000,
+				TickMS:            250,
+				RecvSampleShift:   4,
+				RecvEmitThreshold: 100,
+				Active:            true,
+				// SenderSampleShift, SenderTopkK, WatchSetSize, PortTopN,
+				// EtsTopN, EtsEvery: all absent -> zero, even though nonzero
+				// bytes were passed to the encoder for them.
+				PayloadLen: 48,
+			},
+		},
+		{
+			name:       "length_60_adds_sender_topk_and_watch_set",
+			payloadLen: 60,
+			flags:      scopeConfigFlagActive,
+			wantRecLen: 84,
+			want: &ScopeConfig{
+				RecordHeader: RecordHeader{Len: 84, Type: recTypeScopeConfig,
+					Flags: scopeConfigFlagActive, KTimeNS: tK, UnixNS: tU},
+				SendSampleShift:   63,
+				GCThresholdWords:  40_000,
+				SchedThresholdNS:  2_000_000,
+				SketchCapacity:    8192,
+				MirrorCapacity:    4096,
+				TopkK:             16,
+				MemoryEvery:       5000,
+				TickMS:            250,
+				RecvSampleShift:   4,
+				RecvEmitThreshold: 100,
+				SenderSampleShift: 20,
+				SenderTopkK:       8,
+				WatchSetSize:      32,
+				// PortTopN, EtsTopN, EtsEvery: still absent -> zero.
+				Active:     true,
+				PayloadLen: 60,
+			},
+		},
+		{
+			name:       "length_64_adds_port_top_n",
+			payloadLen: 64,
+			flags:      scopeConfigFlagActive,
+			wantRecLen: 88,
+			want: &ScopeConfig{
+				RecordHeader: RecordHeader{Len: 88, Type: recTypeScopeConfig,
+					Flags: scopeConfigFlagActive, KTimeNS: tK, UnixNS: tU},
+				SendSampleShift:   63,
+				GCThresholdWords:  40_000,
+				SchedThresholdNS:  2_000_000,
+				SketchCapacity:    8192,
+				MirrorCapacity:    4096,
+				TopkK:             16,
+				MemoryEvery:       5000,
+				TickMS:            250,
+				RecvSampleShift:   4,
+				RecvEmitThreshold: 100,
+				SenderSampleShift: 20,
+				SenderTopkK:       8,
+				WatchSetSize:      32,
+				PortTopN:          5,
+				// EtsTopN, EtsEvery: still absent -> zero.
+				Active:     true,
+				PayloadLen: 64,
+			},
+		},
+		{
+			name:       "length_72_newest_writer_full",
+			payloadLen: 72,
+			flags:      scopeConfigFlagActive,
+			wantRecLen: 96,
+			want: &ScopeConfig{
+				RecordHeader: RecordHeader{Len: 96, Type: recTypeScopeConfig,
+					Flags: scopeConfigFlagActive, KTimeNS: tK, UnixNS: tU},
+				SendSampleShift:   63,
+				GCThresholdWords:  40_000,
+				SchedThresholdNS:  2_000_000,
+				SketchCapacity:    8192,
+				MirrorCapacity:    4096,
+				TopkK:             16,
+				MemoryEvery:       5000,
+				TickMS:            250,
+				RecvSampleShift:   4,
+				RecvEmitThreshold: 100,
+				SenderSampleShift: 20,
+				SenderTopkK:       8,
+				WatchSetSize:      32,
+				PortTopN:          5,
+				EtsTopN:           5,
+				EtsEvery:          1000,
+				Active:            true,
+				PayloadLen:        72,
+			},
+		},
+		{
+			// 20 bytes only covers send_sample_shift + part of
+			// gc_threshold_words.
+			name:       "truncated_below_minimum",
+			payloadLen: 20,
+			flags:      0,
+			want:       nil,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// sendShift is the one field the encoder always writes fully
+			// (it is the first field, present at every known length), so it
+			// doubles as the value asserted in want.SendSampleShift; the
+			// truncated case has no want, so any value works.
+			sendShift := uint32(10)
+			if tc.want != nil {
+				sendShift = tc.want.SendSampleShift
+			}
+			raw := encScopeConfig(tc.payloadLen, tc.flags, tK, tU,
+				sendShift, 40_000, 2_000_000, 8192, 4096, 16, 5000,
+				250, 4, 100, 20, 8, 32, 5, 5, 1000)
+
+			if tc.want == nil {
+				if _, err := decodeRecord(raw); !errors.Is(err, errTruncatedRecord) {
+					t.Fatalf("want errTruncatedRecord, got %v", err)
+				}
+				return
+			}
+			if len(raw) != tc.wantRecLen {
+				t.Fatalf("record length %d, want %d", len(raw), tc.wantRecLen)
+			}
+			got, err := decodeRecord(raw)
+			if err != nil {
+				t.Fatalf("decodeRecord: %v", err)
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("decode mismatch:\n got: %#v\nwant: %#v", got, tc.want)
+			}
+		})
 	}
 }
 

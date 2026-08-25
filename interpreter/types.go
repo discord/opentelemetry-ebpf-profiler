@@ -15,6 +15,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
+	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -107,6 +108,16 @@ type EbpfHandler interface {
 	// DeletePidInterpreterMapping removes the element specified by pid, prefix
 	// rom the eBPF map pid_page_to_mapping_info.
 	DeletePidInterpreterMapping(libpf.PID, lpm.Prefix) error
+
+	// UpdateBeamSchedTid adds a BEAM scheduler thread to the eBPF map
+	// beam_sched_tids, enabling per-sample Erlang process attribution for
+	// that kernel tid. Discord addition; see interpreter/beam/beam_sched.go.
+	UpdateBeamSchedTid(tid libpf.PID, info support.BeamSchedInfo) error
+
+	// DeleteBeamSchedTid removes a BEAM scheduler thread from beam_sched_tids,
+	// but only if the map entry still belongs to tgid: kernel tids are reused,
+	// see support/ebpf/beam_sched.h's identity section.
+	DeleteBeamSchedTid(tid libpf.PID, tgid libpf.PID) error
 }
 
 // Loader is a function to detect and load data from given interpreter ELF file.

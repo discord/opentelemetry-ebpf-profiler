@@ -50,6 +50,7 @@ type ebpfMapsImpl struct {
 	RubyProcs          *cebpf.Map `name:"ruby_procs"`
 	V8Procs            *cebpf.Map `name:"v8_procs"`
 	BeamProcs          *cebpf.Map `name:"beam_procs"`
+	BeamSchedTids      *cebpf.Map `name:"beam_sched_tids"`
 	ApmIntProcs        *cebpf.Map `name:"apm_int_procs"`
 	GoLabelsProcs      *cebpf.Map `name:"go_labels_procs"`
 
@@ -217,6 +218,62 @@ func (impl *ebpfMapsImpl) DeleteProcData(typ libpf.InterpreterType, pid libpf.PI
 	pid32 := uint32(pid)
 	if err := ebpfMap.Delete(unsafe.Pointer(&pid32)); err != nil {
 		return fmt.Errorf("failed to remove info: %v", err)
+	}
+	return nil
+}
+
+// UpdateBeamSchedTid adds a BEAM scheduler thread to beam_sched_tids, which
+// enables per-sample Erlang process attribution for that kernel tid.
+func (impl *ebpfMapsImpl) UpdateBeamSchedTid(tid libpf.PID, info support.BeamSchedInfo) error {
+	if impl.BeamSchedTids == nil {
+		// The map is loaded unconditionally (see types.IsMapEnabled), so this
+		// is unreachable in the agent; it keeps a nil deref from taking the
+		// whole process down over an optional label if that ever changes.
+		return fmt.Errorf("beam_sched_tids map is not loaded")
+	}
+	tid32 := uint32(tid)
+	if err := impl.BeamSchedTids.Update(unsafe.Pointer(&tid32), unsafe.Pointer(&info),
+		cebpf.UpdateAny); err != nil {
+		if errors.Is(err, unix.E2BIG) {
+			return fmt.Errorf("no more space in beam_sched_tids")
+		}
+		return fmt.Errorf("failed to add beam scheduler tid %d: %w", tid, err)
+	}
+	return nil
+}
+
+// DeleteBeamSchedTid removes a BEAM scheduler thread from beam_sched_tids,
+// but only while the entry still belongs to tgid. Kernel tids are reused;
+// see support/ebpf/beam_sched.h's identity section for why an unconditional
+// delete here would be able to remove a live, unrelated entry.
+func (impl *ebpfMapsImpl) DeleteBeamSchedTid(tid libpf.PID, tgid libpf.PID) error {
+	if impl.BeamSchedTids == nil {
+		return nil
+	}
+	tid32 := uint32(tid)
+	// The lookup-compare-delete below is not atomic in itself. It is safe only
+	// because every writer of beam_sched_tids runs under the process-manager
+	// write lock (pm.mu): handleNewInterpreter -> Attach ->
+	// UpdateBeamSchedTid, and both Detach call sites. This becomes racy the
+	// moment another writer of this map appears.
+	var existing support.BeamSchedInfo
+	if err := impl.BeamSchedTids.Lookup(unsafe.Pointer(&tid32),
+		unsafe.Pointer(&existing)); err != nil {
+		if errors.Is(err, cebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("failed to look up beam scheduler tid %d: %w", tid, err)
+	}
+	if existing.Tgid != uint32(tgid) {
+		// A different, later BEAM process's Attach already claimed this tid;
+		// it is not ours to remove.
+		return nil
+	}
+	if err := impl.BeamSchedTids.Delete(unsafe.Pointer(&tid32)); err != nil {
+		if errors.Is(err, cebpf.ErrKeyNotExist) {
+			return nil
+		}
+		return fmt.Errorf("failed to remove beam scheduler tid %d: %w", tid, err)
 	}
 	return nil
 }
