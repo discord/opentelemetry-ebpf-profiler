@@ -45,6 +45,8 @@ import (
 	"encoding/binary"
 	"fmt"
 	"net"
+	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -53,6 +55,7 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
 
 // Wire format constants. These are a contract with pstore-ingest; changing one
@@ -60,12 +63,43 @@ import (
 const (
 	// SocketMagic opens every connection. 8 bytes, ASCII, no terminator.
 	SocketMagic = "PSTRSOK1"
-	// SocketVersion is the stream version in the header.
-	SocketVersion uint16 = 1
+	// SocketVersion is the stream version in the header. Version 2 added the
+	// four fields v1 could not carry -- value, value_kind, erlang_pid_key and
+	// custom labels -- which is what lets the socket own a beamscope capture
+	// outright instead of requiring the pprof file alongside it.
+	SocketVersion uint16 = 2
 	// SocketHeaderLen is the byte length of the stream header. A reader
 	// consumes exactly this many bytes (read from the header itself), so a
 	// later version can grow the header without breaking the framing.
-	SocketHeaderLen uint16 = 32
+	SocketHeaderLen uint16 = 40
+)
+
+// Value kinds. A sample carries at most one measurement of its own, and
+// value_kind says which column it belongs in -- the wire equivalent of the
+// pprof file's one-column-per-origin rule. These numbers are the wire's own,
+// deliberately not samples.ValueKind*, so renumbering upstream cannot silently
+// relabel a capture.
+const (
+	// SocketValueKindNone means the sample carries no measurement of its own
+	// and `value` is meaningless. Every non-beamscope sample is this.
+	SocketValueKindNone uint8 = 0
+	// SocketValueKindAlloc is allocated words (GC_DELTA/GC_DELTA2).
+	SocketValueKindAlloc uint8 = 1
+	// SocketValueKindSchedNS is on-scheduler nanoseconds (SCHED_DELTA).
+	SocketValueKindSchedNS uint8 = 2
+	// SocketValueKindMsgs is scaled message arrivals (MSG_FLOW).
+	SocketValueKindMsgs uint8 = 3
+)
+
+// Label kinds, in each label entry's kind byte.
+const (
+	// SocketLabelString is a string label: value_strid holds it, num and
+	// unit_strid are zero.
+	SocketLabelString uint8 = 0
+	// SocketLabelNumeric is a numeric label: num holds the value and
+	// unit_strid names its unit, value_strid is zero. The pprof path writes
+	// exactly these as pprof numeric labels, so the two agree field for field.
+	SocketLabelNumeric uint8 = 1
 )
 
 // Stream flags, in the header's flags word.
@@ -73,8 +107,8 @@ const (
 	// StreamFlagFramesLeafFirst is set when each SAMPLE's frame array is
 	// ordered leaf-first, as the tracer delivers it and as the pprof writer
 	// orders Location. A consumer building a root-first folded key reverses.
-	// It is always set in version 1; it exists so that a producer that ever
-	// flips the order is DETECTED rather than silently mis-folded.
+	// It is always set; it exists so that a producer that ever flips the order
+	// is DETECTED rather than silently mis-folded.
 	StreamFlagFramesLeafFirst uint32 = 1 << 0
 )
 
@@ -100,8 +134,9 @@ const (
 
 // Fixed-size parts of the payloads, in bytes, excluding the 1-byte rec_type.
 const (
-	socketSampleFixedLen = 64
+	socketSampleFixedLen = 80
 	socketFrameLen       = 12
+	socketLabelLen       = 24
 	socketStatsLen       = 80
 	socketStrdefFixedLen = 8
 )
@@ -284,6 +319,8 @@ type socketSink struct {
 	// string a sample references must be resolved BEFORE the payload is
 	// started. Writer goroutine only.
 	frefs []fref
+	lrefs []lref
+	lkeys []string
 
 	stopOnce sync.Once
 	stop     chan struct{}
@@ -783,7 +820,7 @@ func (s *socketSink) connFailed(err error) {
 }
 
 func (s *socketSink) writeHeader() error {
-	var h [32]byte
+	var h [SocketHeaderLen]byte
 	copy(h[0:8], SocketMagic)
 	binary.LittleEndian.PutUint16(h[8:10], SocketVersion)
 	binary.LittleEndian.PutUint16(h[10:12], SocketHeaderLen)
@@ -791,6 +828,13 @@ func (s *socketSink) writeHeader() error {
 	binary.LittleEndian.PutUint32(h[16:20], uint32(s.cfg.SamplesPerSecond))
 	binary.LittleEndian.PutUint32(h[20:24], uint32(s.cfg.MaxFrames))
 	binary.LittleEndian.PutUint64(h[24:32], uint64(ktimeNs()))
+	// The two strides make the record layout self-describing: a reader that
+	// knows only v2 can still walk a v3 SAMPLE by skipping sample_fixed_len
+	// rather than the 80 it was compiled against, and the same for labels.
+	// This is what v1 lacked and why v1 could not be grown in place.
+	binary.LittleEndian.PutUint16(h[32:34], socketSampleFixedLen)
+	binary.LittleEndian.PutUint16(h[34:36], socketLabelLen)
+	binary.LittleEndian.PutUint32(h[36:40], 0)
 	s.armWriteDeadline()
 	return s.writeBuffered(h[:])
 }
@@ -867,6 +911,18 @@ func (s *socketSink) writeSample(ev *sampleEvent) error {
 		s.frefs = append(s.frefs, fref{fn, fl})
 	}
 
+	// Labels, resolved in sorted key order. The order is deliberate, not
+	// incidental: ev.labels is a map, so serializing in range order would make
+	// two byte-identical captures produce different streams, which breaks the
+	// equivalence fixture and any downstream diff that hashes a record.
+	//
+	// Contract keys are skipped exactly as the pprof path skips them: a traced
+	// process must not be able to overwrite the reporter's own comm or origin
+	// by emitting a custom label of that name.
+	if err := s.resolveLabels(ev); err != nil {
+		return err
+	}
+
 	// The drop delta is read at serialization time, so it attributes losses to
 	// the gap they most plausibly belong to. The TOTAL is exact (STATS); the
 	// per-record attribution is exact to within one writer iteration.
@@ -877,7 +933,8 @@ func (s *socketSink) writeSample(ev *sampleEvent) error {
 		delta = 0xffffffff
 	}
 
-	payload := socketSampleFixedLen + nFrames*socketFrameLen
+	payload := socketSampleFixedLen + nFrames*socketFrameLen +
+		len(s.lrefs)*socketLabelLen
 	s.scratch = s.scratch[:0]
 	s.scratch = binary.LittleEndian.AppendUint32(s.scratch, uint32(payload+1))
 	s.scratch = append(s.scratch, RecSample)
@@ -897,7 +954,17 @@ func (s *socketSink) writeSample(ev *sampleEvent) error {
 	fixed[56] = socketOrigin(ev.origin)
 	fixed[57] = flags
 	binary.LittleEndian.PutUint16(fixed[58:60], uint16(nFrames))
-	binary.LittleEndian.PutUint32(fixed[60:64], 0)
+	binary.LittleEndian.PutUint16(fixed[60:62], uint16(len(s.lrefs)))
+	fixed[62] = socketValueKind(ev.valueKind)
+	fixed[63] = 0
+	// value is meaningless unless value_kind says which column it belongs in,
+	// so a kind of None writes a zero value rather than whatever the field
+	// happened to hold: a consumer must never find a number here it could
+	// mistake for a measurement.
+	if fixed[62] != SocketValueKindNone {
+		binary.LittleEndian.PutUint64(fixed[64:72], uint64(ev.value))
+	}
+	binary.LittleEndian.PutUint64(fixed[72:80], ev.erlangPidKey)
 	s.scratch = append(s.scratch, fixed[:]...)
 
 	for i := 0; i < nFrames; i++ {
@@ -906,12 +973,70 @@ func (s *socketSink) writeSample(ev *sampleEvent) error {
 		s.scratch = binary.LittleEndian.AppendUint32(s.scratch, uint32(ev.frames[i].line))
 	}
 
+	for _, l := range s.lrefs {
+		var b [socketLabelLen]byte
+		binary.LittleEndian.PutUint32(b[0:4], l.key)
+		binary.LittleEndian.PutUint32(b[4:8], l.val)
+		binary.LittleEndian.PutUint32(b[8:12], l.unit)
+		b[12] = l.kind
+		binary.LittleEndian.PutUint64(b[16:24], uint64(l.num))
+		s.scratch = append(s.scratch, b[:]...)
+	}
+
 	s.armWriteDeadline()
 	if err := s.writeBuffered(s.scratch); err != nil {
 		return err
 	}
 	// Not emitted yet: it is in the write buffer. flush() promotes it.
 	s.pendingSamples++
+	return nil
+}
+
+// resolveLabels fills s.lrefs from ev.labels, interning every string it needs.
+// It mirrors the pprof path's rules exactly -- same reserved-key skip, same
+// beamscope-only numeric promotion, same units -- because the whole point of
+// carrying labels on the wire is that a consumer reconstructing a profile from
+// the stream gets the same labels the file would have had.
+func (s *socketSink) resolveLabels(ev *sampleEvent) error {
+	s.lrefs = s.lrefs[:0]
+	if len(ev.labels) == 0 {
+		return nil
+	}
+	s.lkeys = s.lkeys[:0]
+	for k := range ev.labels {
+		if _, reserved := contractLabelKeys[k]; reserved {
+			continue
+		}
+		s.lkeys = append(s.lkeys, k)
+	}
+	sort.Strings(s.lkeys)
+
+	beam := socketOrigin(ev.origin) == socketOriginBeamScope
+	for _, k := range s.lkeys {
+		kid, err := s.str(k)
+		if err != nil {
+			return err
+		}
+		v := ev.labels[k]
+		if beam {
+			if unit, numeric := numLabelUnits[k]; numeric {
+				if n, perr := strconv.ParseInt(v, 10, 64); perr == nil {
+					uid, uerr := s.str(unit)
+					if uerr != nil {
+						return uerr
+					}
+					s.lrefs = append(s.lrefs,
+						lref{key: kid, unit: uid, kind: SocketLabelNumeric, num: n})
+					continue
+				}
+			}
+		}
+		vid, err := s.str(v)
+		if err != nil {
+			return err
+		}
+		s.lrefs = append(s.lrefs, lref{key: kid, val: vid, kind: SocketLabelString})
+	}
 	return nil
 }
 
@@ -944,6 +1069,31 @@ func (s *socketSink) writeStats() error {
 // originTable (local_egress.go) together with the origin's validity and
 // its pprof label name, so a new origin cannot be added to two of the three and
 // forgotten in the third.
+// socketValueKind maps the reporter's value kind onto the wire's own
+// numbering. The two happen to agree today; mapping explicitly means an
+// upstream renumbering shows up as a compile error or an Unknown, never as a
+// capture whose alloc words are silently relabelled as scheduler nanoseconds.
+func socketValueKind(k uint8) uint8 {
+	switch k {
+	case samples.ValueKindAlloc:
+		return SocketValueKindAlloc
+	case samples.ValueKindSchedNS:
+		return SocketValueKindSchedNS
+	case samples.ValueKindMsgs:
+		return SocketValueKindMsgs
+	default:
+		return SocketValueKindNone
+	}
+}
+
+// lref is one label resolved to string-table ids, assembled before the SAMPLE
+// payload the way fref is.
+type lref struct {
+	key, val, unit uint32
+	kind           uint8
+	num            int64
+}
+
 func socketOrigin(o libpf.Origin) uint8 {
 	if info, ok := originTable[o]; ok {
 		return info.wire

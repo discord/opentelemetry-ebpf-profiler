@@ -34,10 +34,10 @@ var beamscopeEgress beamscopeEgressArgs
 const (
 	beamscopeHelp = "Enable the beamscope BEAM runtime-instrumentation reader: discover " +
 		"beam_scope shared-memory segments in BEAM processes and report GC allocation " +
-		"deltas through the active reporter (origin \"beamscope\"). Requires " +
-		"-pprof-dir: the OTLP path freezes the per-sample labels, and the v1 socket " +
-		"wire carries neither them nor a beamscope sample's value or erlang_pid_key, " +
-		"so -socket-egress alone does not satisfy this."
+		"deltas through the active reporter (origin \"beamscope\"). Requires a " +
+		"local egress -- either -pprof-dir or -socket-egress, both of which carry " +
+		"a beamscope sample's value, erlang_pid_key and per-sample labels. The " +
+		"OTLP path does not, because it freezes the labels."
 	beamscopePollIntervalHelp = "How often each attached BEAM's beamscope rings are " +
 		"drained. This bounds record latency and, together with the ring size, how much " +
 		"burst the rings can absorb before the writer drops."

@@ -365,13 +365,13 @@ design -- so a reference can never dangle. The table resets on reconnect.
 Measured on a real 479,660-sample capture: 101,788 STRDEFs cover 5.8M frame
 references.
 
-**`rec_type = 2` SAMPLE** -- one raw sample, never aggregated. Fixed part 64 bytes:
+**`rec_type = 2` SAMPLE** -- one raw sample, never aggregated. Fixed part 80 bytes:
 
 | off | size | field |
 |---|---|---|
 | 0  | 8 | `i64` ktime_ns (`bpf_ktime_get_ns`, CLOCK_MONOTONIC) |
 | 8  | 8 | `i64` unix_ns (derived CLOCK_REALTIME; carried, never compared against ktime) |
-| 16 | 8 | `i64` off_time_ns. **Meaningful only for `origin = 2` (off_cpu).** It reads 0 for `origin = 4` (beamscope): the two-column reporter smuggled a beamscope sample's own value through this field; the five-column one does not (see 3.8), so a v1 socket consumer sees beamscope samples with no value at all. |
+| 16 | 8 | `i64` off_time_ns. **Meaningful only for `origin = 2` (off_cpu).** It reads 0 for `origin = 4` (beamscope), whose own measurement lives in `value`/`value_kind` below -- the two-column reporter once smuggled it through this field, the five-column one does not (see 3.8). |
 | 24 | 4 | `i32` pid |
 | 28 | 4 | `i32` tid |
 | 32 | 4 | `i32` cpu |
@@ -383,21 +383,44 @@ references.
 | 56 | 1 | `u8` origin: 1 sampling, 2 off_cpu, 3 probe, 4 beamscope. Numbered independently of libpf's so an upstream renumbering cannot silently relabel a capture. |
 | 57 | 1 | `u8` flags; bit 0 = frame list TRUNCATED |
 | 58 | 2 | `u16` n_frames |
-| 60 | 4 | `u32` reserved, must be 0 |
-
-**What v1 does NOT carry.** The fixed part has no room for them and no version
-bump was taken, so a socket consumer does not see: `value`/`valueKind` (section 3.8 -- so beamscope samples arrive valueless, as noted for
-`off_time_ns` above), `erlang_pid_key` (section 3.9 -- a `u64` term
-does not fit the one spare `u32`), and custom labels of any kind. Anything
-needing those reads the pprof files, which carry all three. Adding them means a
-v2 header, not a reinterpretation of v1 bytes.
-
-This is also why `-beamscope` requires `-pprof-dir` and is NOT satisfied by
-`-socket-egress` alone: a socket-only beamscope run would start clean and then
-stream beamscope samples stripped of every beamscope-specific field.
+| 60 | 2 | `u16` n_labels |
+| 62 | 1 | `u8` value_kind: 0 none, 1 alloc words, 2 sched nanoseconds, 3 msgs count. Numbered independently of `samples.ValueKind*` for the same reason `origin` is. |
+| 63 | 1 | `u8` reserved, must be 0 |
+| 64 | 8 | `i64` value -- the sample's own measurement, in the unit `value_kind` names. **Written as 0 whenever `value_kind` is 0**, so a consumer can never find a number here it might mistake for a measurement. |
+| 72 | 8 | `u64` erlang_pid_key -- raw Erlang pid Eterm (section 3.9), 0 when unattributable. Never "pid 0". |
 
 then `n_frames` x 12 bytes, **leaf-first** (as the tracer delivers them and as
 the pprof writer orders `Location`): `u32 func_str`, `u32 file_str`, `i32 line`.
+
+then `n_labels` x 24 bytes, **sorted by key**, so two identical captures
+serialize byte-identically:
+
+| off | size | field |
+|---|---|---|
+| 0 | 4 | `u32` key -> string id |
+| 4 | 4 | `u32` value -> string id (string labels; 0 for numeric) |
+| 8 | 4 | `u32` unit -> string id (numeric labels; 0 for string) |
+| 12 | 1 | `u8` kind: 0 string, 1 numeric |
+| 13 | 3 | reserved, must be 0 |
+| 16 | 8 | `i64` num (numeric labels; 0 for string) |
+
+A label whose key is one the reporter assigns itself (`comm`, `origin`, `pid`,
+... -- the contract keys of 3.6) is **skipped**, exactly as the pprof path skips
+it: a traced process must not be able to overwrite the reporter's own values by
+emitting a custom label of that name. Numeric promotion applies to
+beamscope-origin samples only, using the same unit table the pprof writer uses,
+so the two backends produce the same labels for the same event.
+
+**The socket is beamscope-complete.** As of v2 it carries all four of the things
+v1 could not: `value`, `value_kind`, `erlang_pid_key`, and custom labels. So
+`-beamscope` is satisfied by **either** local backend, and a socket-only capture
+is a whole capture rather than one silently stripped of everything
+beamscope-specific. `TestSocketBeamscopeSampleMatchesPprof` compares the two
+backends field for field on the same event; that equivalence is the contract.
+
+What still does not satisfy `-beamscope` is having no local egress at all: the
+OTLP path aggregates on the trace hash and freezes per-sample labels at first
+insert, which is wrong data rather than missing data.
 A consumer building a root-first folded key reverses.
 
 **`rec_type = 3` STATS** -- the producer's counters, 80 bytes: `i64 ktime_ns`,
@@ -463,11 +486,12 @@ DefaultSampleType = "cpu"
 `OffTime` is once again exclusively the off-CPU sample's off-scheduler
 nanoseconds -- beamscope never sets it.
 
-**This is a real, unfixed loss on the socket path:** the v1 wire format (section 3.7) carries
-`off_time_ns` but not `value`/`valueKind`, so where a two-column-era socket
-consumer got a beamscope sample's value out of `off_time_ns`, it now gets 0
-and there is no other field holding it. The pprof files carry the value
-correctly; the socket stream does not. Fixing it needs a v2 header.
+This was a real loss on the socket path until wire v2: v1 carried `off_time_ns`
+but not `value`/`value_kind`, so where a two-column-era socket consumer read a
+beamscope sample's value out of `off_time_ns`, it got 0 and no other field held
+it. **v2 carries `value` and `value_kind` as their own fields** (section 3.7),
+so both backends now express the same measurement -- the file in its own column,
+the wire in its own field.
 
 The fill rule, exactly one measurement column non-zero per sample:
 

@@ -20,6 +20,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
+	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
 // decodedSample is what a consumer reconstructs from the wire, used here to
@@ -32,20 +34,36 @@ type decodedSample struct {
 	containerID       string
 	origin            uint8
 	flags             uint8
+	// value/valueKind are the sample's own measurement; valueKind says which
+	// column it belongs in. erlangPidKey is 0 when unattributable.
+	value        int64
+	valueKind    uint8
+	erlangPidKey uint64
+	// labels in wire order (sorted by key). Numeric labels carry num+unit;
+	// string labels carry str.
+	labels []decodedLabel
 	// frames, leaf-first as the wire carries them.
 	funcs []string
 	files []string
 	lines []int32
 }
 
+type decodedLabel struct {
+	key, str, unit string
+	kind           uint8
+	num            int64
+}
+
 type decodedStream struct {
-	version    uint16
-	flags      uint32
-	rate       uint32
-	maxFrames  uint32
-	samples    []decodedSample
-	lastStats  map[string]uint64
-	statsCount int
+	version        uint16
+	flags          uint32
+	rate           uint32
+	maxFrames      uint32
+	samples        []decodedSample
+	lastStats      map[string]uint64
+	statsCount     int
+	sampleFixedLen uint16
+	labelStride    uint16
 }
 
 // readStream is a reference decoder for the wire format. Its whole job is to
@@ -53,7 +71,7 @@ type decodedStream struct {
 // mistake shows up here rather than in the Rust consumer.
 func readStream(t *testing.T, r io.Reader) *decodedStream {
 	t.Helper()
-	var hdr [32]byte
+	var hdr [64]byte
 	_, err := io.ReadFull(r, hdr[:8])
 	require.NoError(t, err)
 	require.Equal(t, SocketMagic, string(hdr[:8]))
@@ -69,6 +87,12 @@ func readStream(t *testing.T, r io.Reader) *decodedStream {
 	out.flags = binary.LittleEndian.Uint32(hdr[12:16])
 	out.rate = binary.LittleEndian.Uint32(hdr[16:20])
 	out.maxFrames = binary.LittleEndian.Uint32(hdr[20:24])
+	// The strides are what make the layout self-describing; a reader walks by
+	// them rather than by the constants it was compiled against.
+	out.sampleFixedLen = binary.LittleEndian.Uint16(hdr[32:34])
+	out.labelStride = binary.LittleEndian.Uint16(hdr[34:36])
+	require.Equal(t, uint16(socketSampleFixedLen), out.sampleFixedLen)
+	require.Equal(t, uint16(socketLabelLen), out.labelStride)
 
 	strs := map[uint32]string{0: ""}
 	var lenBuf [4]byte
@@ -102,15 +126,34 @@ func readStream(t *testing.T, r io.Reader) *decodedStream {
 				containerID:      strs[binary.LittleEndian.Uint32(p[52:56])],
 				origin:           p[56],
 				flags:            p[57],
+				valueKind:        p[62],
+				value:            int64(binary.LittleEndian.Uint64(p[64:72])),
+				erlangPidKey:     binary.LittleEndian.Uint64(p[72:80]),
 			}
-			require.Equal(t, uint32(0), binary.LittleEndian.Uint32(p[60:64]),
-				"reserved word must be zero")
-			fr := p[64:]
+			nl := int(binary.LittleEndian.Uint16(p[60:62]))
+			require.Equal(t, uint8(0), p[63], "reserved byte must be zero")
+			if s.valueKind == SocketValueKindNone {
+				require.Zero(t, s.value,
+					"value must be zero when no kind claims it")
+			}
+			fr := p[int(out.sampleFixedLen):]
 			for i := 0; i < nf; i++ {
 				o := i * socketFrameLen
 				s.funcs = append(s.funcs, strs[binary.LittleEndian.Uint32(fr[o:o+4])])
 				s.files = append(s.files, strs[binary.LittleEndian.Uint32(fr[o+4:o+8])])
 				s.lines = append(s.lines, int32(binary.LittleEndian.Uint32(fr[o+8:o+12])))
+			}
+			lb := fr[nf*socketFrameLen:]
+			for i := 0; i < nl; i++ {
+				o := i * int(out.labelStride)
+				dl := decodedLabel{
+					key:  strs[binary.LittleEndian.Uint32(lb[o:o+4])],
+					str:  strs[binary.LittleEndian.Uint32(lb[o+4:o+8])],
+					unit: strs[binary.LittleEndian.Uint32(lb[o+8:o+12])],
+					kind: lb[o+12],
+					num:  int64(binary.LittleEndian.Uint64(lb[o+16 : o+24])),
+				}
+				s.labels = append(s.labels, dl)
 			}
 			out.samples = append(out.samples, s)
 		case RecStats:
@@ -917,4 +960,186 @@ func TestSocketSinkDrainDialFailureStaysBounded(t *testing.T) {
 	assert.Less(t, time.Since(start), 5*time.Second, "drain must not retry-loop")
 	assert.Equal(t, uint64(2), s.Dropped())
 	assert.Nil(t, s.conn)
+}
+
+// labelsByKey indexes a decoded sample's labels for assertion.
+func labelsByKey(s decodedSample) map[string]decodedLabel {
+	out := make(map[string]decodedLabel, len(s.labels))
+	for _, l := range s.labels {
+		out[l.key] = l
+	}
+	return out
+}
+
+// beamscopeEvent is a beamscope-origin sample carrying every field class the
+// wire has to reproduce: a measurement with a kind, an Erlang pid, a numeric
+// custom label with a unit, and a string custom label.
+func beamscopeEvent(t *testing.T) (*libpf.Trace, *samples.TraceEventMeta) {
+	t.Helper()
+	tr := testTrace(t, "root", "leaf")
+	tr.CustomLabels = map[libpf.String]libpf.String{
+		libpf.Intern("pause_ns"):       libpf.Intern("4096"),
+		libpf.Intern("mbuf_words"):     libpf.Intern("77"),
+		libpf.Intern("beamscope_kind"): libpf.Intern("alloc"),
+	}
+	m := meta(7, 11, 12, "beam.smp", "p", "x")
+	m.Origin = support.TraceOriginBeamScope
+	m.Value = 54_321
+	m.ValueKind = samples.ValueKindAlloc
+	m.ErlangPidKey = 0x1234_5678_9abc_def0
+	return tr, m
+}
+
+// The socket must carry a beamscope sample WHOLE with no pprof sink in
+// existence. This is the property that lets -beamscope run socket-only: value,
+// value_kind, erlang_pid_key and custom labels all survive the wire.
+func TestSocketSinkCarriesBeamscopeSampleWithoutPprof(t *testing.T) {
+	l := newListener(t)
+	r, err := NewLocalEgress(LocalEgressConfig{
+		SamplesPerSecond: 997,
+		Socket:           SocketConfig{Path: l.path, FlushInterval: 5 * time.Millisecond},
+	})
+	require.NoError(t, err)
+	require.Nil(t, r.pprof, "this test is meaningless if a pprof sink exists")
+	require.NoError(t, r.Start(t.Context()))
+	tr, m := beamscopeEvent(t)
+	require.NoError(t, r.ReportTraceEvent(tr, m))
+	require.NoError(t, r.Flush())
+	r.Stop()
+
+	st := readStream(t, bytes.NewReader(l.readAll(t)))
+	require.Equal(t, SocketVersion, st.version)
+	require.Len(t, st.samples, 1)
+	got := st.samples[0]
+
+	assert.Equal(t, int64(54_321), got.value)
+	assert.Equal(t, SocketValueKindAlloc, got.valueKind)
+	assert.Equal(t, uint64(0x1234_5678_9abc_def0), got.erlangPidKey)
+
+	byKey := labelsByKey(got)
+	require.Contains(t, byKey, "pause_ns")
+	assert.Equal(t, SocketLabelNumeric, byKey["pause_ns"].kind)
+	assert.Equal(t, int64(4096), byKey["pause_ns"].num)
+	assert.Equal(t, "nanoseconds", byKey["pause_ns"].unit)
+
+	require.Contains(t, byKey, "mbuf_words")
+	assert.Equal(t, int64(77), byKey["mbuf_words"].num)
+	assert.Equal(t, "words", byKey["mbuf_words"].unit)
+
+	require.Contains(t, byKey, "beamscope_kind")
+	assert.Equal(t, SocketLabelString, byKey["beamscope_kind"].kind)
+	assert.Equal(t, "alloc", byKey["beamscope_kind"].str)
+}
+
+// The two backends must agree field for field, or "socket-only" silently means
+// "a different capture". Same event, both backends, compared.
+func TestSocketBeamscopeSampleMatchesPprof(t *testing.T) {
+	l := newListener(t)
+	dir := t.TempDir()
+	r, err := NewLocalEgress(LocalEgressConfig{
+		Dir: dir, SamplesPerSecond: 997,
+		Socket: SocketConfig{Path: l.path, FlushInterval: 5 * time.Millisecond},
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.Start(t.Context()))
+	tr, m := beamscopeEvent(t)
+	require.NoError(t, r.ReportTraceEvent(tr, m))
+	require.NoError(t, r.Flush())
+	r.Stop()
+
+	st := readStream(t, bytes.NewReader(l.readAll(t)))
+	require.Len(t, st.samples, 1)
+	byKey := labelsByKey(st.samples[0])
+
+	p := readOne(t, dir)
+	require.Len(t, p.Sample, 1)
+	ps := p.Sample[0]
+
+	// The measurement lands in the alloc column of the file and in
+	// value/value_kind on the wire; both must say 54321 allocated words.
+	require.Len(t, ps.Value, 5)
+	assert.Equal(t, ps.Value[2], st.samples[0].value)
+	assert.Equal(t, "alloc", p.SampleType[2].Type)
+
+	// Erlang attribution: a numeric label in the file, a fixed field on the
+	// wire, same number.
+	require.Contains(t, ps.NumLabel, LabelErlangPidKey)
+	assert.Equal(t, uint64(ps.NumLabel[LabelErlangPidKey][0]),
+		st.samples[0].erlangPidKey)
+
+	// Numeric custom labels: same value AND same unit on both paths.
+	for _, k := range []string{"pause_ns", "mbuf_words"} {
+		require.Contains(t, ps.NumLabel, k, "pprof lost %s", k)
+		require.Contains(t, byKey, k, "socket lost %s", k)
+		assert.Equal(t, ps.NumLabel[k][0], byKey[k].num, "%s value", k)
+		assert.Equal(t, ps.NumUnit[k][0], byKey[k].unit, "%s unit", k)
+	}
+	// String custom labels likewise.
+	require.Contains(t, ps.Label, "beamscope_kind")
+	assert.Equal(t, ps.Label["beamscope_kind"][0], byKey["beamscope_kind"].str)
+}
+
+// A traced process must not be able to overwrite the reporter's own fields by
+// emitting a custom label of a contract name -- the same rule the pprof path
+// enforces, enforced identically here.
+func TestSocketSinkSkipsReservedLabelNames(t *testing.T) {
+	l := newListener(t)
+	r, err := NewLocalEgress(LocalEgressConfig{
+		SamplesPerSecond: 997,
+		Socket:           SocketConfig{Path: l.path, FlushInterval: 5 * time.Millisecond},
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.Start(t.Context()))
+	tr := testTrace(t, "leaf")
+	tr.CustomLabels = map[libpf.String]libpf.String{
+		libpf.Intern("comm"):   libpf.Intern("not-the-real-comm"),
+		libpf.Intern("origin"): libpf.Intern("lies"),
+		libpf.Intern("keep"):   libpf.Intern("kept"),
+	}
+	require.NoError(t, r.ReportTraceEvent(tr, meta(1, 1, 2, "realcomm", "p", "x")))
+	require.NoError(t, r.Flush())
+	r.Stop()
+
+	st := readStream(t, bytes.NewReader(l.readAll(t)))
+	require.Len(t, st.samples, 1)
+	byKey := labelsByKey(st.samples[0])
+	assert.NotContains(t, byKey, "comm")
+	assert.NotContains(t, byKey, "origin")
+	assert.Contains(t, byKey, "keep")
+	assert.Equal(t, "realcomm", st.samples[0].comm)
+}
+
+// Labels are serialized in sorted key order so two identical captures produce
+// identical bytes. Map range order would make this flaky rather than wrong,
+// which is worse.
+func TestSocketSinkLabelOrderIsDeterministic(t *testing.T) {
+	run := func() []string {
+		l := newListener(t)
+		r, err := NewLocalEgress(LocalEgressConfig{
+			SamplesPerSecond: 997,
+			Socket:           SocketConfig{Path: l.path, FlushInterval: 5 * time.Millisecond},
+		})
+		require.NoError(t, err)
+		require.NoError(t, r.Start(t.Context()))
+		tr := testTrace(t, "leaf")
+		tr.CustomLabels = map[libpf.String]libpf.String{
+			libpf.Intern("zeta"):  libpf.Intern("1"),
+			libpf.Intern("alpha"): libpf.Intern("2"),
+			libpf.Intern("mid"):   libpf.Intern("3"),
+			libpf.Intern("beta"):  libpf.Intern("4"),
+		}
+		require.NoError(t, r.ReportTraceEvent(tr, meta(1, 1, 2, "c", "p", "x")))
+		require.NoError(t, r.Flush())
+		r.Stop()
+		st := readStream(t, bytes.NewReader(l.readAll(t)))
+		require.Len(t, st.samples, 1)
+		var keys []string
+		for _, lb := range st.samples[0].labels {
+			keys = append(keys, lb.key)
+		}
+		return keys
+	}
+	want := []string{"alpha", "beta", "mid", "zeta"}
+	assert.Equal(t, want, run())
+	assert.Equal(t, want, run(), "label order must not vary between runs")
 }
