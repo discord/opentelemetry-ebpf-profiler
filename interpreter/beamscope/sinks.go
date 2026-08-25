@@ -224,14 +224,27 @@ func (s *reporterSink) handleGCDelta(r *GCDelta) {
 
 // handleGCDelta2 synthesizes one sample per GC_DELTA2 (0x08) record: the 0x01
 // shape plus mbuf_words and pause_ns.
+//
+// When the record carries NO_START the writer never saw the matching
+// gc_start, so it zero-filled pause_ns and mbuf_words. Emitting those as num
+// labels would be a plausible-looking lie -- a 0 ns pause is indistinguishable
+// from a genuinely fast GC once it is averaged into pause statistics -- so
+// they are OMITTED for that sample, the same discipline handleSchedDelta
+// applies to preempts/yields. alloc_words (the sample VALUE) and
+// bin_vheap_delta are measured either way and always emitted. The label
+// contract is unchanged: no key is added or renamed, an unmeasured one is
+// simply absent. gc_kind is not a label here and reaches no sink, so there is
+// nothing to suppress for it beyond the struct's own documentation.
 func (s *reporterSink) handleGCDelta2(r *GCDelta2) {
+	labels := map[libpf.String]libpf.String{
+		labelBinVheapDelta: fmtU64(r.BinVheapDeltaWords),
+	}
+	if !r.NoStart {
+		labels[labelMbufWords] = fmtU64(r.MbufWords)
+		labels[labelPauseNS] = fmtU64(r.PauseNS)
+	}
 	s.reportSample(&r.RecordHeader, r.PidKey, int64(r.AllocWords), kindAlloc,
-		samples.ValueKindAlloc,
-		map[libpf.String]libpf.String{
-			labelBinVheapDelta: fmtU64(r.BinVheapDeltaWords),
-			labelMbufWords:     fmtU64(r.MbufWords),
-			labelPauseNS:       fmtU64(r.PauseNS),
-		})
+		samples.ValueKindAlloc, labels)
 }
 
 // handleSchedDelta synthesizes one sample per SCHED_DELTA (0x0A) record:
