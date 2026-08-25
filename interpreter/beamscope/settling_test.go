@@ -11,10 +11,10 @@ package beamscope
 // with proper naming.
 
 import (
-	"os"
 	"testing"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
+	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
 
 // TestFrameRanking pins the ABI display ranking:
@@ -162,8 +162,15 @@ func TestMetaSettlingExpiry(t *testing.T) {
 	if got := mock.traces[0].Frames[0].Value().FunctionName.String(); got != "<beam_pid_key:0x3002>" {
 		t.Fatalf("expired frame %q, want pid_key fallback", got)
 	}
-	if mock.metas[0].OffTime != 7_000_000 {
-		t.Fatalf("expired sample value %d, want 7000000", mock.metas[0].OffTime)
+	if mock.metas[0].Value != 7_000_000 {
+		t.Fatalf("expired sample value %d, want 7000000", mock.metas[0].Value)
+	}
+	if mock.metas[0].ValueKind != samples.ValueKindSchedNS {
+		t.Fatalf("expired sample ValueKind %d, want ValueKindSchedNS", mock.metas[0].ValueKind)
+	}
+	if mock.metas[0].OffTime != 0 {
+		t.Fatalf("expired sample OffTime %d, want 0 (retired as a beamscope value channel)",
+			mock.metas[0].OffTime)
 	}
 	if len(d.held) != 0 {
 		t.Fatalf("held = %d after expiry, want 0", len(d.held))
@@ -193,14 +200,17 @@ func TestMetaSettlingCap(t *testing.T) {
 		t.Fatalf("heldEvicted=%d held=%d, want 1 and 2", d.heldEvicted, len(d.held))
 	}
 
-	// Shutdown must flush the remainder — a held sample is never lost.
+	// Shutdown must flush the remainder -- a held sample is never lost.
 	d.shutdown()
 	if len(mock.traces) != 3 {
 		t.Fatalf("after shutdown %d traces, want 3", len(mock.traces))
 	}
 	vals := map[int64]bool{}
 	for _, m := range mock.metas {
-		vals[m.OffTime] = true
+		vals[m.Value] = true
+		if m.ValueKind != samples.ValueKindAlloc {
+			t.Errorf("sample ValueKind %d, want ValueKindAlloc", m.ValueKind)
+		}
 	}
 	if !vals[1000] || !vals[2000] || !vals[3000] {
 		t.Fatalf("sample values lost across settling: %v", vals)
@@ -212,19 +222,7 @@ func TestMetaSettlingCap(t *testing.T) {
 // Assertions are provisional until the orchestrator relays the writer's
 // ground-truth counts.
 func TestRecordedFixtureV3(t *testing.T) {
-	path := os.Getenv("BEAMSCOPE_FIXTURE_V3")
-	if path == "" {
-		path = "/home/discord/dev/worktrees/main/.worktrees/sanchda/evil_beam_shit/" +
-			"discord_common/ex/beam_scope/test/fixtures/shm_v3.bin"
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Skipf("v3 recorded fixture not available: %v", err)
-	}
-	seg, err := NewSegment(raw)
-	if err != nil {
-		t.Fatalf("v3 recorded fixture rejected: %v", err)
-	}
+	seg := loadRecordedSegment(t, "BEAMSCOPE_FIXTURE_V3", "shm_v3.bin")
 	recs, st := collect(seg)
 	if st.CorruptRings != 0 {
 		t.Errorf("v3 fixture has %d corrupt rings", st.CorruptRings)

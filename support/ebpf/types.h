@@ -668,6 +668,25 @@ typedef struct LuaJITProcInfo {
   u8 dummy;
 } LuaJITProcInfo;
 
+// BeamSchedInfo is the per-scheduler-thread data needed to attribute a CPU
+// sample to the Erlang process the scheduler is running. It is keyed by kernel
+// tid, so one entry exists per BEAM scheduler thread on the host.
+//
+// esdp_addr is the already-biased address of this thread's ErtsSchedulerData
+// (i.e. &erts_aligned_scheduler_data[no-1], or the dirty-CPU array's
+// equivalent); off_current_proc is offsetof(ErtsSchedulerData,
+// current_process). Both are resolved and validated in user space before the
+// entry is written -- see interpreter/beam/beam_sched.go -- so the eBPF side
+// never has to reason about OTP versions.
+//
+// tgid is the BEAM process the entry was written for. See beam_sched.h's
+// identity section for why the map value must be bound to it.
+typedef struct BeamSchedInfo {
+  u64 esdp_addr;
+  u32 off_current_proc;
+  u32 tgid;
+} BeamSchedInfo;
+
 // COMM_LEN defines the maximum length we will receive for the comm of a task.
 #define COMM_LEN 16
 
@@ -770,6 +789,8 @@ typedef struct Trace {
   // value stores context-specific data that was collected with the stack.
   // e.g. time in nanoseconds for off-CPU traces
   u64 value;
+  // Raw Erlang PID term of the process running on the sampled scheduler.
+  u64 erlang_pid_key;
 
   // NOTE: both send_trace in BPF and loadBpfTrace in UM code require `variable_data`
   // to be the last item in the struct. When sending via the ringbuffer, only the

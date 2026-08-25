@@ -11,6 +11,7 @@ package beamscope
 import (
 	"encoding/binary"
 	"io"
+	"math"
 	"testing"
 	"time"
 
@@ -158,6 +159,73 @@ func TestReporterMetaCacheEvictedOnProcExit(t *testing.T) {
 	}
 }
 
+// TestLatestScopeConfigSelectedByMaxKtimeAcrossRings pins the ABI.md rule:
+// latestConfig is selected by MAX ktime_ns ACROSS ALL RINGS, not by which
+// record the drainer happened to process most recently. Ring 2's config
+// carries the later ktime_ns; it is drained (and so dispatched) BEFORE ring
+// 0's, in the same poll -- so a naive "last dispatched wins" implementation
+// would already pass here. The second half of the test is what actually
+// catches that bug: a config with an EARLIER ktime_ns arrives on ring 0 in a
+// LATER poll (so it is genuinely "processed more recently" in wall-clock
+// dispatch order) and must NOT displace the still-later-ktime config already
+// held from ring 2.
+func TestLatestScopeConfigSelectedByMaxKtimeAcrossRings(t *testing.T) {
+	f := newFixture(t, 3, 4096)
+	// Ring 2: the later-ktime config, drained first within the pass (ring
+	// order is 0, 1, 2) purely because there is nothing on ring 0 yet.
+	f.mustWrite(t, 2, encScopeConfig(48, scopeConfigFlagActive, 300, tU,
+		1, 111, 222, 8, 8, 8, 8, 8, 8, 8, 0, 0, 0, 0, 0, 0))
+	seg := f.mustSegment(t)
+	d := newTestDrainer(t, seg, &mockReporter{}, t.TempDir(), testPID)
+
+	d.drainOnce()
+	if d.latestConfig == nil {
+		t.Fatal("latestConfig not set after draining ring 2's config")
+	}
+	if d.latestConfig.KTimeNS != 300 {
+		t.Fatalf("latestConfig.KTimeNS = %d, want 300 (ring 2)", d.latestConfig.KTimeNS)
+	}
+
+	// Ring 0: an earlier-ktime config, written and drained in a later poll.
+	f.mustWrite(t, 0, encScopeConfig(48, 0, 100, tU,
+		2, 999, 999, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0))
+	d.drainOnce()
+	if d.latestConfig.KTimeNS != 300 {
+		t.Fatalf("ring 0's earlier-ktime config wrongly became latest "+
+			"(got ktime_ns=%d): the max-ktime-across-rings rule was violated",
+			d.latestConfig.KTimeNS)
+	}
+	if d.latestConfig.SendSampleShift != 1 {
+		t.Fatalf("latestConfig fields changed even though it should still be "+
+			"ring 2's record: SendSampleShift=%d, want 1", d.latestConfig.SendSampleShift)
+	}
+
+	// A genuinely later ktime, arriving later, DOES replace it.
+	f.mustWrite(t, 0, encScopeConfig(48, 0, 400, tU,
+		3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0))
+	d.drainOnce()
+	if d.latestConfig.KTimeNS != 400 {
+		t.Fatalf("latestConfig.KTimeNS = %d, want 400 (genuinely newer config "+
+			"was not adopted)", d.latestConfig.KTimeNS)
+	}
+
+	// The drainer's own JSONL record of latestConfig selection does not
+	// starve the sidecar: every SCOPE_CONFIG record still reaches JSONL, not
+	// just the one selected as latest.
+	lines := readJSONL(t, d.jsonl)
+	var scopeConfigLines int
+	for _, obj := range lines {
+		if obj["type"] == "scope_config" {
+			scopeConfigLines++
+		}
+	}
+	if scopeConfigLines != 3 {
+		t.Fatalf("JSONL has %d scope_config lines, want 3 (one per record, "+
+			"regardless of which became latestConfig)", scopeConfigLines)
+	}
+	d.shutdown()
+}
+
 // TestEvictMetaOnExitRespectsSettlingHold is FIX-6's guard: while a
 // pprof-bound record for a pid is still parked awaiting its PROC_META, a
 // PROC_EXIT for that pid must not evict (there is nothing cached to evict yet,
@@ -178,7 +246,7 @@ func TestEvictMetaOnExitRespectsSettlingHold(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode gc: %v", err)
 	}
-	d.holdOrReport(gc.(*GCDelta), pk)
+	d.holdOrReport(heldRecord{rec: gc.(*GCDelta), pidKey: pk})
 	if len(d.held) != 1 {
 		t.Fatalf("expected the GC_DELTA to be held, held=%d", len(d.held))
 	}
@@ -188,5 +256,41 @@ func TestEvictMetaOnExitRespectsSettlingHold(t *testing.T) {
 	d.evictMetaOnExit(pk)
 	if _, ok := d.rep.metaCache[0xA]; !ok {
 		t.Fatal("evictMetaOnExit wrongly dropped an unrelated pid's meta")
+	}
+}
+
+// Both inputs to the receive-sample scaling come from an untrusted shared
+// memory segment. Wrapping into a negative message count would be summed into
+// a pprof total; saturating keeps a nonsense input visibly nonsense.
+func TestScaleArrivalsSaturates(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		raw   uint64
+		shift uint32
+		want  int64
+	}{
+		{"zero raw", 0, 62, 0},
+		{"zero shift", 12345, 0, 12345},
+		{"typical", 1000, 10, 1000 << 10},
+		{"exactly at the limit", 1, 62, 1 << 62},
+		{"one past the limit", 2, 62, math.MaxInt64},
+		{"large raw at shift 62", 1 << 40, 62, math.MaxInt64},
+		{"max raw at shift 1", math.MaxUint64, 1, math.MaxInt64},
+		{"sign bit would be set", uint64(math.MaxInt64)/4 + 1, 2, math.MaxInt64},
+		// The caller rejects shift >= 63, but the helper must not wrap if that
+		// ever changes: Go yields 0 for an over-wide shift, so this saturates.
+		{"shift 63", 3, 63, math.MaxInt64},
+		{"shift 64", 3, 64, math.MaxInt64},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := scaleArrivals(tc.raw, tc.shift)
+			if got != tc.want {
+				t.Fatalf("scaleArrivals(%d, %d) = %d, want %d",
+					tc.raw, tc.shift, got, tc.want)
+			}
+			if got < 0 {
+				t.Fatalf("negative message count %d", got)
+			}
+		})
 	}
 }

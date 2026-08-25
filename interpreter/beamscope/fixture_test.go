@@ -242,13 +242,26 @@ func encMonitorEvent(ktime, unix, pidKey uint64, kind uint8, value uint64) []byt
 
 func encPanelTick(ktime, unix uint64, epoch, panelSize, watchSize uint32,
 	processCount uint64) []byte {
+	// Pre-dropped_ticks writer: bytes 12-15 zero and the flag clear.
+	return encPanelTickDropped(ktime, unix, epoch, panelSize, watchSize,
+		processCount, 0, false)
+}
+
+// encPanelTickDropped writes the dropped_ticks u32 at payload offset 12 and
+// sets panelTickFlagDroppedValid when valid, matching the current writer.
+func encPanelTickDropped(ktime, unix uint64, epoch, panelSize, watchSize uint32,
+	processCount uint64, dropped uint32, valid bool) []byte {
 	var p payloadWriter
 	p.u32(epoch)
 	p.u32(panelSize)
 	p.u32(watchSize)
-	p.u32(0) // reserved
+	p.u32(dropped)
 	p.u64(processCount)
-	return encRecord(recTypePanelTick, 0, ktime, unix, p.b)
+	var flags uint32
+	if valid {
+		flags = panelTickFlagDroppedValid
+	}
+	return encRecord(recTypePanelTick, flags, ktime, unix, p.b)
 }
 
 func encGCDelta2(ktime, unix, pidKey, alloc, binVheap, mbuf, heap, pause uint64,
@@ -292,6 +305,143 @@ func encSchedDelta(flags uint32, ktime, unix, pidKey, onSched uint64,
 	p.u32(yields)
 	p.u32(0) // reserved
 	return encRecord(recTypeSchedDelta, flags, ktime, unix, p.b)
+}
+
+// encScopeConfig builds a SCOPE_CONFIG (0x0B) record at an EXACT payload
+// length (the ABI's LOGICAL lengths are 36, 40, 48, 60, 64, and 72; any other
+// value is a deliberately truncated/malformed test fixture). Unlike
+// encRecord, the total record length here is NOT rounded to 8-byte alignment:
+// with a 24-byte header, payload lengths 40, 48, 64, and 72 land on an
+// already-aligned total (64, 72, 88, 96), while 36 and 60 do not (60, 84).
+//
+// On the wire that never happens: the writer always pads a record to
+// align8(24 + payload) and zero-fills the tail, so a decoded ScopeConfig's
+// PayloadLen is always the PADDED length. A logical 36 arrives as 40, a
+// logical 60 as 64, and 48/64/72 arrive unchanged. That is precisely why the
+// generation gates read a zero as "off/absent" rather than trying to detect
+// absence: at a padded length the bytes for a field the writer never had are
+// present and zero, which is the same thing the absent-vs-zero convention
+// already promises everywhere else.
+//
+// decodeRecord itself has no 8-byte-alignment requirement -- that is a
+// ring-framing invariant owned by shm.go's drainRing, not a decode-level one
+// -- so building the record at its exact UNPADDED byte count here is what
+// exercises the shorter generations at the decode level: passing a real
+// 40-byte record with tick_ms==0 would be indistinguishable from a 36-byte
+// record with tick_ms absent. Such a record cannot be pushed through a real
+// ring (it desyncs the framing); ring-level tests use the 8-aligned lengths.
+// Fields past payloadLen are simply not written (the caller controls which
+// ones exist via payloadLen, not via the values passed for them).
+func encScopeConfig(payloadLen int, flags uint32, ktime, unix uint64,
+	sendShift uint32, gcThreshold, schedThreshold uint64,
+	sketchCap, mirrorCap, topkK, memEvery, tickMs, recvShift, recvEmit,
+	senderSampleShift, senderTopkK, watchSetSize, portTopN, etsTopN,
+	etsEvery uint32) []byte {
+	var p payloadWriter
+	p.u32(sendShift)
+	p.u64(gcThreshold)
+	p.u64(schedThreshold)
+	p.u32(sketchCap)
+	p.u32(mirrorCap)
+	p.u32(topkK)
+	p.u32(memEvery)
+	p.u32(tickMs)
+	p.u32(recvShift)
+	p.u32(recvEmit)
+	p.u32(senderSampleShift)
+	p.u32(senderTopkK)
+	p.u32(watchSetSize)
+	p.u32(portTopN)
+	p.u32(etsTopN)
+	p.u32(etsEvery)
+	if payloadLen > len(p.b) {
+		panic("encScopeConfig: payloadLen exceeds the full known field set")
+	}
+	payload := p.b[:payloadLen]
+	rec := make([]byte, recordHeaderSize+payloadLen)
+	binary.LittleEndian.PutUint16(rec[0:], uint16(len(rec)))
+	binary.LittleEndian.PutUint16(rec[2:], recTypeScopeConfig)
+	binary.LittleEndian.PutUint32(rec[4:], flags)
+	binary.LittleEndian.PutUint64(rec[8:], ktime)
+	binary.LittleEndian.PutUint64(rec[16:], unix)
+	copy(rec[recordHeaderSize:], payload)
+	return rec
+}
+
+func encSenderTopk(ktime, unix, destPidKey, senderPidKey, estArrivals uint64,
+	epoch uint32, rank uint8) []byte {
+	var p payloadWriter
+	p.u64(destPidKey)
+	p.u64(senderPidKey)
+	p.u64(estArrivals)
+	p.u32(epoch)
+	p.u8(rank)
+	return encRecord(recTypeSenderTopk, 0, ktime, unix, p.b)
+}
+
+// encPortStat builds a PORT_STAT (0x0F) record. nodeName is appended (and
+// portStatFlagDist set) only when dist is true, matching the ABI's
+// present-only-when-flagged convention for the trailing string.
+func encPortStat(ktime, unix, portKey, queueSizeBytes, connectedPidKey uint64,
+	epoch uint32, rank uint8, driverName, portPrintable string,
+	dist bool, nodeName string) []byte {
+	var p payloadWriter
+	p.u64(portKey)
+	p.u64(queueSizeBytes)
+	p.u64(connectedPidKey)
+	p.u32(epoch)
+	p.u8(rank)
+	p.str(driverName)
+	p.str(portPrintable)
+	var flags uint32
+	if dist {
+		flags = portStatFlagDist
+		p.str(nodeName)
+	}
+	return encRecord(recTypePortStat, flags, ktime, unix, p.b)
+}
+
+// encEtsStat builds an ETS_STAT (0x10) record.
+func encEtsStat(ktime, unix, ownerPidKey, memoryWords, sizeObjects uint64,
+	epoch uint32, rank uint8, name string, sweepTruncated bool) []byte {
+	var p payloadWriter
+	p.u64(ownerPidKey)
+	p.u64(memoryWords)
+	p.u64(sizeObjects)
+	p.u32(epoch)
+	p.u8(rank)
+	p.str(name)
+	var flags uint32
+	if sweepTruncated {
+		flags = etsStatFlagSweepTruncated
+	}
+	return encRecord(recTypeEtsStat, flags, ktime, unix, p.b)
+}
+
+func encVMStat(flags uint32, ktime, unix, ctxSwitches, runQueueTotal,
+	ioIn, ioOut, reductions uint64, atomCount, portCount uint32,
+	memTotal, memProcesses, memBinary, memEts uint64, epoch uint32) []byte {
+	var p payloadWriter
+	p.u64(ctxSwitches)
+	p.u64(runQueueTotal)
+	p.u64(ioIn)
+	p.u64(ioOut)
+	p.u64(reductions)
+	p.u32(atomCount)
+	p.u32(portCount)
+	p.u64(memTotal)
+	p.u64(memProcesses)
+	p.u64(memBinary)
+	p.u64(memEts)
+	p.u32(epoch)
+	return encRecord(recTypeVMStat, flags, ktime, unix, p.b)
+}
+
+func encMsgFlow(ktime, unix, pidKey, arrivalsRaw uint64) []byte {
+	var p payloadWriter
+	p.u64(pidKey)
+	p.u64(arrivalsRaw)
+	return encRecord(recTypeMsgFlow, 0, ktime, unix, p.b)
 }
 
 // mustSegment validates the fixture bytes through the real entry point.

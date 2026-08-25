@@ -87,6 +87,13 @@ func Debugf(msg string, keysAndValues ...any) {
 	}
 }
 
+// DebugEnabled reports whether debug logging is on. Debugf's arguments are
+// evaluated by the caller whatever the level, so a diagnostic that costs
+// something real to compute needs this gate around it.
+func DebugEnabled() bool {
+	return getLogger().Enabled(context.Background(), slog.LevelDebug)
+}
+
 // Debug logs detailed debugging information about internal profiler behavior.
 // This is a wrapper around Debugf for convenience.
 func Debug(msg string) {

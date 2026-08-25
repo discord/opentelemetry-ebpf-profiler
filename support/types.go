@@ -250,6 +250,11 @@ type BEAMProcInfo struct {
 	Native_func_mfa_offset           uint16
 	Native_func_argc_offset          uint16
 }
+type BeamSchedInfo struct {
+	Esdp_addr        uint64
+	Off_current_proc uint32
+	Tgid             uint32
+}
 type DotnetProcInfo struct {
 	Version uint32
 }

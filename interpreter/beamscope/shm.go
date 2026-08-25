@@ -19,7 +19,7 @@
 // record's len word (pairing with the writer's release-store) before reading
 // its payload; and, per ABI v1.1, the reader must zero the ENTIRE consumed
 // byte range (not merely each len word) before the release-store of the
-// advanced read_pos — otherwise stale interior bytes from a previous lap
+// advanced read_pos -- otherwise stale interior bytes from a previous lap
 // inside a fresh reservation could be misparsed as a published record.
 package beamscope // import "go.opentelemetry.io/ebpf-profiler/interpreter/beamscope"
 

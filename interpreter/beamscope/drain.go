@@ -9,6 +9,7 @@ package beamscope // import "go.opentelemetry.io/ebpf-profiler/interpreter/beams
 
 import (
 	"errors"
+	"math"
 	"sync"
 	"time"
 
@@ -24,11 +25,12 @@ import (
 const heldMaxCycles = 2
 
 // defaultHeldCap bounds the meta-settling buffer. Past it the oldest held
-// record is converted immediately (with fallback naming — the sample is never
+// record is converted immediately (with fallback naming -- the sample is never
 // discarded) and counted as evicted.
 const defaultHeldCap = 4096
 
-// heldRecord is a pprof-bound record (GC_DELTA/GC_DELTA2/SCHED_DELTA) parked
+// heldRecord is a pprof-bound record (GC_DELTA/GC_DELTA2/SCHED_DELTA/
+// MSG_FLOW) parked
 // because its pid_key had no cached PROC_META at drain time. Holding it a
 // couple of poll cycles lets the writer's lazily-emitted metadata catch up,
 // so early records do not bake fallback frames into the profile (the
@@ -40,6 +42,16 @@ type heldRecord struct {
 	rec    Record
 	pidKey uint64
 	gen    uint64
+	// msgShift/msgShiftOK carry the MSG_FLOW receive-sample shift resolved
+	// when the record was DISPATCHED, not when it is finally converted: the
+	// writer's SCOPE_CONFIG can change inside the settling window, and a
+	// record must be scaled by the config that was in force when it arrived
+	// (see resolveRecvShift). msgShiftOK false means no retained config could
+	// scale it AT DISPATCH; reportBound then retries the resolve once (the
+	// covering config may have been in a later ring) and only counts the skip
+	// if that also fails. Both are unset for every other record type.
+	msgShift   uint32
+	msgShiftOK bool
 }
 
 // drainer owns one attached BEAM process end to end.
@@ -59,6 +71,25 @@ type drainer struct {
 	rep   *reporterSink
 	jsonl *jsonlSink
 
+	// latestConfig is the most recently observed SCOPE_CONFIG, selected by
+	// MAX ktime_ns across ALL rings (ABI.md's rule), not by dispatch/arrival
+	// order: a later-ktime config drained from one ring is never displaced by
+	// an earlier-ktime one processed after it from another ring. Only
+	// touched from the drain goroutine, like the meta cache.
+	//
+	// prevConfig is the second-newest config seen, by the same ktime_ns
+	// ordering. The max-ktime rule governs which config is HELD; it never
+	// governs which config a given record is scaled BY. Because DrainInto
+	// walks rings 0..n-1 while the writer's records are only ordered within
+	// a ring, a config drained early in a pass can be NEWER than a record
+	// drained later in that same pass -- scaling by the latched config would
+	// then apply a shift that was not yet in force when the record was
+	// written. Retaining one generation of history is enough for the
+	// realistic one-change-per-window case: see resolveRecvShift, which
+	// picks the newest retained config that is not newer than the record.
+	latestConfig *ScopeConfig
+	prevConfig   *ScopeConfig
+
 	stats DrainStats
 	// statsEmitted is false until the first drain after activation has
 	// published a drain_stats line: that first line carries the writer's
@@ -72,6 +103,17 @@ type drainer struct {
 	heldCap         int
 	heldEvicted     uint64
 	lastHeldEvicted uint64
+	// msgFlowScaleSkipped counts MSG_FLOW records for which no pprof sample
+	// was synthesized because no retained SCOPE_CONFIG that predates the
+	// record could support scaling (none seen yet, every retained one newer
+	// than the record, one too old to carry RecvSampleShift, or receive
+	// tracing disabled). The raw record still reaches the JSONL sidecar
+	// either way (see dispatch). Surfaced in the
+	// drain_stats JSONL line (see drainOnce/WriteDrainStats), same treatment
+	// as heldEvicted below: otherwise it is invisible outside a white-box
+	// test.
+	msgFlowScaleSkipped     uint64
+	lastMsgFlowScaleSkipped uint64
 	// pollGen counts drainOnce passes; held records expire when the drainer
 	// is heldMaxCycles generations past their enqueue.
 	pollGen uint64
@@ -213,7 +255,8 @@ func (d *drainer) drainOnce() {
 	}
 	statsChanged := st.Dropped != d.stats.Dropped ||
 		st.CorruptRings != d.stats.CorruptRings ||
-		d.heldEvicted != d.lastHeldEvicted
+		d.heldEvicted != d.lastHeldEvicted ||
+		d.msgFlowScaleSkipped != d.lastMsgFlowScaleSkipped
 	prevDropped := d.stats.Dropped
 	d.stats.Records += st.Records
 	d.stats.Padding += st.Padding
@@ -230,40 +273,117 @@ func (d *drainer) drainOnce() {
 			log.Infof("beamscope: PID %d writer dropped %d records total (+%d)",
 				d.pid, st.Dropped, st.Dropped-prevDropped)
 		}
-		d.jsonl.WriteDrainStats(&d.stats, len(d.held), d.heldEvicted)
+		d.jsonl.WriteDrainStats(&d.stats, len(d.held), d.heldEvicted, d.msgFlowScaleSkipped)
 		d.statsEmitted = true
 		d.lastHeldEvicted = d.heldEvicted
+		d.lastMsgFlowScaleSkipped = d.msgFlowScaleSkipped
 	}
 	d.jsonl.Flush()
 }
 
-// reportBound converts one pprof-bound record into a reporter sample.
-func (d *drainer) reportBound(rec Record) {
-	switch r := rec.(type) {
+// reportBound converts one pprof-bound record into a reporter sample. For
+// MSG_FLOW it prefers the shift resolved at dispatch time
+// (heldRecord.msgShift) over the config latched by now: a record parked
+// awaiting its PROC_META must not be rescaled by a config that arrived during
+// the hold.
+//
+// Only when dispatch could resolve NOTHING is the resolve retried here. A
+// SCOPE_CONFIG can land in ANY ring (hence the max-ktime-across-rings rule),
+// so the config that covers this record may sit in a higher-numbered ring
+// than the record and not be latched yet when the record is dispatched.
+// Retrying at conversion time picks it up, because the pass that read the
+// record has since completed. Correctness is unchanged: resolveRecvShift
+// never accepts a config newer than the record, at either point. The skip is
+// counted here, after the retry, so it is counted exactly once (reportBound
+// runs once per record) and only for records nothing could ever scale.
+func (d *drainer) reportBound(h heldRecord) {
+	switch r := h.rec.(type) {
 	case *GCDelta:
 		d.rep.handleGCDelta(r)
 	case *GCDelta2:
 		d.rep.handleGCDelta2(r)
 	case *SchedDelta:
 		d.rep.handleSchedDelta(r)
+	case *MsgFlow:
+		shift, ok := h.msgShift, h.msgShiftOK
+		if !ok {
+			shift, ok = d.resolveRecvShift(r.KTimeNS)
+		}
+		if !ok {
+			// Nothing retained can scale this record. The raw record already
+			// reached JSONL, so nothing is lost; only the pprof sample is.
+			d.msgFlowScaleSkipped++
+			return
+		}
+		d.rep.handleMsgFlow(r, scaleArrivals(r.ArrivalsRaw, shift))
 	}
+}
+
+// resolveRecvShift picks the receive-sample shift for a record stamped at
+// ktime, from the newest RETAINED SCOPE_CONFIG that is NOT NEWER than the
+// record (KTimeNS <= ktime). A newer config was not yet in force when the
+// record was written, so scaling by it would produce a wrong number rather
+// than a missing one.
+//
+// Once such a config is found it is authoritative: if it predates
+// RecvSampleShift (PayloadLen < 48) or says receive tracing is disabled
+// (RecvSampleShift >= 63), the answer is "cannot scale" -- falling further
+// back in history would resurrect a shift the writer has since retired. If no
+// retained config qualifies (none seen yet, or every retained one is newer
+// than the record), the answer is also "cannot scale": the shift is never
+// guessed.
+func (d *drainer) resolveRecvShift(ktime uint64) (uint32, bool) {
+	for _, cfg := range [2]*ScopeConfig{d.latestConfig, d.prevConfig} {
+		if cfg == nil || cfg.KTimeNS > ktime {
+			continue
+		}
+		if cfg.PayloadLen < 48 || cfg.RecvSampleShift >= 63 {
+			return 0, false
+		}
+		return cfg.RecvSampleShift, true
+	}
+	return 0, false
+}
+
+// scaleArrivals applies a SCOPE_CONFIG receive-sample shift to a raw arrival
+// count, saturating at the int64 maximum.
+//
+// Both inputs come from an untrusted shared-memory segment: the shift is only
+// bounded to < 63 by the caller, so a large raw count shifted by 62 overflows
+// a uint64 and, short of that, easily exceeds int64 -- which would arrive in
+// pprof as a NEGATIVE message count and be summed into a total. Saturating is
+// the same discipline clampSchedCount applies in the BEAM interpreter: a
+// nonsense input must stay visibly nonsense rather than wrap into a plausible
+// value. A saturated count is a bad sample; a negative one is a bad total.
+func scaleArrivals(raw uint64, shift uint32) int64 {
+	if raw == 0 {
+		return 0
+	}
+	// raw <= MaxInt64>>shift is exactly the condition for raw<<shift to fit.
+	// Go defines an over-wide shift as yielding 0, so shift >= 63 saturates
+	// here too without a special case.
+	if raw > uint64(math.MaxInt64)>>shift {
+		return math.MaxInt64
+	}
+	return int64(raw << shift)
 }
 
 // holdOrReport parks a pprof-bound record until its PROC_META is cached, up
 // to heldMaxCycles polls. Past heldCap the oldest held record is converted
 // immediately with the fallback ranking (never discarded) and counted.
-func (d *drainer) holdOrReport(rec Record, pidKey uint64) {
-	if d.rep.hasMeta(pidKey) {
-		d.reportBound(rec)
+func (d *drainer) holdOrReport(h heldRecord) {
+	if d.rep.hasMeta(h.pidKey) {
+		d.reportBound(h)
 		return
 	}
 	if len(d.held) >= d.heldCap && len(d.held) > 0 {
-		d.reportBound(d.held[0].rec)
+		d.reportBound(d.held[0])
 		d.held[0] = heldRecord{} // release the Record for GC
 		d.held = d.held[1:]
 		d.heldEvicted++
 	}
-	d.held = append(d.held, heldRecord{rec: rec, pidKey: pidKey, gen: d.pollGen})
+	h.gen = d.pollGen
+	d.held = append(d.held, h)
 }
 
 // releaseHeld converts (in arrival order) every held record whose PROC_META
@@ -272,7 +392,7 @@ func (d *drainer) releaseHeld(pidKey uint64) {
 	kept := d.held[:0]
 	for _, h := range d.held {
 		if h.pidKey == pidKey {
-			d.reportBound(h.rec)
+			d.reportBound(h)
 		} else {
 			kept = append(kept, h)
 		}
@@ -291,7 +411,7 @@ func (d *drainer) ageHeld() {
 	d.pollGen++
 	n := 0
 	for n < len(d.held) && d.pollGen-d.held[n].gen >= heldMaxCycles {
-		d.reportBound(d.held[n].rec)
+		d.reportBound(d.held[n])
 		d.held[n] = heldRecord{} // release the Record for GC
 		n++
 	}
@@ -304,7 +424,7 @@ func (d *drainer) ageHeld() {
 // sample must never be lost).
 func (d *drainer) flushHeld() {
 	for _, h := range d.held {
-		d.reportBound(h.rec)
+		d.reportBound(h)
 	}
 	d.held = nil
 }
@@ -313,11 +433,30 @@ func (d *drainer) flushHeld() {
 func (d *drainer) dispatch(rec Record) {
 	switch r := rec.(type) {
 	case *GCDelta:
-		d.holdOrReport(r, r.PidKey)
+		d.holdOrReport(heldRecord{rec: r, pidKey: r.PidKey})
 	case *GCDelta2:
-		d.holdOrReport(r, r.PidKey)
+		d.holdOrReport(heldRecord{rec: r, pidKey: r.PidKey})
 	case *SchedDelta:
-		d.holdOrReport(r, r.PidKey)
+		d.holdOrReport(heldRecord{rec: r, pidKey: r.PidKey})
+	case *MsgFlow:
+		// The scaling shift is resolved HERE, against the record's own
+		// ktime_ns, and latched onto the held record: by the time the record
+		// is converted the latched config may have moved on (a later ring in
+		// this same pass, or a later poll while it settles), and scaling by
+		// that would give a wrong count rather than a missing one.
+		//
+		// A failure to resolve here is NOT final: the covering config may
+		// simply live in a higher-numbered ring that this pass has not read
+		// yet, so reportBound retries and counts the skip.
+		//
+		// Unlike the other pprof-bound types, MSG_FLOW also always reaches
+		// JSONL: the pprof sample may be skipped when no retained config can
+		// scale the record, but the raw record must never be lost.
+		shift, ok := d.resolveRecvShift(r.KTimeNS)
+		d.holdOrReport(heldRecord{
+			rec: r, pidKey: r.PidKey, msgShift: shift, msgShiftOK: ok,
+		})
+		d.jsonl.Write(r)
 	case *ProcMeta:
 		d.rep.cacheProcMeta(r)
 		d.releaseHeld(r.PidKey)
@@ -325,10 +464,36 @@ func (d *drainer) dispatch(rec Record) {
 	case *ProcExit:
 		d.evictMetaOnExit(r.PidKey)
 		d.jsonl.Write(r)
-	case *PanelSample, *TopkSend, *MonitorEvent, *PanelTick, *SchedUtil:
+	case *ScopeConfig:
+		d.updateLatestConfig(r)
+		d.jsonl.Write(r)
+	case *PanelSample, *TopkSend, *MonitorEvent, *PanelTick, *SchedUtil,
+		*VMStat, *SenderTopk, *PortStat, *EtsStat:
+		// JSONL-only: these carry no pid_key stack worth synthesizing into a
+		// pprof sample.
 		d.jsonl.Write(rec)
 	default:
 		// decodeRecord only produces the types above; nothing to do.
+	}
+}
+
+// updateLatestConfig applies the max-ktime-across-rings selection rule: sc
+// becomes latestConfig only if it is strictly newer (by ktime_ns) than what
+// is currently held, regardless of which ring sc came from or when it was
+// dispatched relative to the current holder. The displaced holder is demoted
+// to prevConfig rather than dropped, and a config that is not the newest but
+// is newer than the retained previous one takes that slot -- so the two
+// newest configs seen (by ktime_ns) are always the two retained, whatever
+// order they were dispatched in. resolveRecvShift needs that history to
+// scale a record by a config that was actually in force when it was written.
+func (d *drainer) updateLatestConfig(sc *ScopeConfig) {
+	switch {
+	case d.latestConfig == nil || sc.KTimeNS > d.latestConfig.KTimeNS:
+		d.prevConfig = d.latestConfig
+		d.latestConfig = sc
+	case sc.KTimeNS < d.latestConfig.KTimeNS &&
+		(d.prevConfig == nil || sc.KTimeNS > d.prevConfig.KTimeNS):
+		d.prevConfig = sc
 	}
 }
 

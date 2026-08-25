@@ -5,7 +5,7 @@ package beamscope
 
 // Whole-pipeline tests: a fixture segment is drained through a real drainer
 // into (a) an in-memory reporter mock and (b) the JSONL sidecar, and further
-// through the fork's PprofFileReporter to validate the pprof-side contract
+// through the fork's local-egress reporter to validate the pprof-side contract
 // (origin name, value channel, custom labels). No live BEAM, no mmap: the
 // drainer runs against an in-memory segment via the test constructor below.
 
@@ -71,16 +71,16 @@ func drainUntilSettled(d *drainer) {
 
 // newPprofReporter returns a file reporter writing into a fresh temp dir,
 // together with that dir. Tests flush by hand, so the interval is disabled.
-func newPprofReporter(t *testing.T) (*reporter.PprofFileReporter, string) {
+func newPprofReporter(t *testing.T) (*reporter.LocalEgressReporter, string) {
 	t.Helper()
 	dir := t.TempDir()
-	rep, err := reporter.NewPprofFile(reporter.PprofFileConfig{
+	rep, err := reporter.NewLocalEgress(reporter.LocalEgressConfig{
 		Dir:              dir,
 		SamplesPerSecond: 20, // required by the reporter; not meaningful here
 		FlushInterval:    time.Hour,
 	})
 	if err != nil {
-		t.Fatalf("NewPprofFile: %v", err)
+		t.Fatalf("NewLocalEgress: %v", err)
 	}
 	return rep, dir
 }
@@ -194,8 +194,15 @@ func TestPipelineToMockReporterAndJSONL(t *testing.T) {
 		if meta.Origin != support.TraceOriginBeamScope {
 			t.Errorf("trace %d origin %v, want TraceOriginBeamScope", i, meta.Origin)
 		}
-		if meta.OffTime != wantAlloc[i] {
-			t.Errorf("trace %d value (OffTime) %d, want %d", i, meta.OffTime, wantAlloc[i])
+		if meta.Value != wantAlloc[i] {
+			t.Errorf("trace %d value %d, want %d", i, meta.Value, wantAlloc[i])
+		}
+		if meta.ValueKind != samples.ValueKindAlloc {
+			t.Errorf("trace %d ValueKind %d, want ValueKindAlloc", i, meta.ValueKind)
+		}
+		if meta.OffTime != 0 {
+			t.Errorf("trace %d OffTime %d, want 0 (retired as a beamscope value channel)",
+				i, meta.OffTime)
 		}
 		if meta.KTime != int64(tK+uint64(10*(i+1))) {
 			t.Errorf("trace %d KTime %d, want %d", i, meta.KTime, tK+uint64(10*(i+1)))
@@ -393,11 +400,20 @@ func TestPipelineThroughPprofFileReporter(t *testing.T) {
 		if len(s.NumLabel["ktime_ns"]) != 1 {
 			t.Errorf("sample missing ktime_ns label")
 		}
-		if len(s.Value) != 2 || s.Value[0] != 1 {
-			t.Fatalf("sample values %v, want [1 alloc_words]", s.Value)
+		// Five columns: samples, cpu, alloc, sched, msgs. An alloc sample
+		// carries its value in column 2 only; the rest (notably cpu) stay 0 --
+		// this is the mixing bug pinned dead.
+		if len(s.Value) != 5 || s.Value[0] != 1 {
+			t.Fatalf("sample values %v, want [1 0 alloc_words 0 0]", s.Value)
 		}
-		if !wantValues[s.Value[1]] {
-			t.Errorf("unexpected sample value %d", s.Value[1])
+		if s.Value[1] != 0 || s.Value[3] != 0 || s.Value[4] != 0 {
+			t.Errorf("alloc sample leaked into another column: %v", s.Value)
+		}
+		if !wantValues[s.Value[2]] {
+			t.Errorf("unexpected sample value %d", s.Value[2])
+		}
+		if got := s.Label["beamscope_kind"]; len(got) != 1 || got[0] != "alloc" {
+			t.Errorf("sample beamscope_kind %v, want [alloc]", got)
 		}
 		if len(s.Label["erlang_pid"]) == 1 {
 			sawErlangPid++
@@ -467,8 +483,19 @@ func TestPipelineV2Types(t *testing.T) {
 		if got := tr.CustomLabels[labelBeamscopeKind].String(); got != wt.kind {
 			t.Errorf("trace %d beamscope_kind %q, want %q", i, got, wt.kind)
 		}
-		if meta.OffTime != wt.value {
-			t.Errorf("trace %d value %d, want %d", i, meta.OffTime, wt.value)
+		if meta.Value != wt.value {
+			t.Errorf("trace %d value %d, want %d", i, meta.Value, wt.value)
+		}
+		wantKind := samples.ValueKindAlloc
+		if wt.kind == "sched" {
+			wantKind = samples.ValueKindSchedNS
+		}
+		if meta.ValueKind != wantKind {
+			t.Errorf("trace %d ValueKind %d, want %d", i, meta.ValueKind, wantKind)
+		}
+		if meta.OffTime != 0 {
+			t.Errorf("trace %d OffTime %d, want 0 (retired as a beamscope value channel)",
+				i, meta.OffTime)
 		}
 	}
 	// GC_DELTA2 extras.
@@ -554,7 +581,26 @@ func TestPipelineV2ThroughPprofFileReporter(t *testing.T) {
 		if len(kind) != 1 {
 			t.Fatalf("sample missing beamscope_kind: %v", s.Label)
 		}
-		kinds[kind[0]] = append(kinds[kind[0]], s.Value[1])
+		// alloc's value lives in column 2, sched's in column 3; the other
+		// measurement columns (including cpu, column 1) must stay 0.
+		var valueCol int
+		switch kind[0] {
+		case "alloc":
+			valueCol = 2
+		case "sched":
+			valueCol = 3
+		default:
+			t.Fatalf("unexpected beamscope_kind %q", kind[0])
+		}
+		for col, v := range s.Value {
+			if col == 0 || col == valueCol {
+				continue
+			}
+			if v != 0 {
+				t.Errorf("%s sample leaked value into column %d: %v", kind[0], col, s.Value)
+			}
+		}
+		kinds[kind[0]] = append(kinds[kind[0]], s.Value[valueCol])
 
 		switch kind[0] {
 		case "alloc":
@@ -582,6 +628,100 @@ func TestPipelineV2ThroughPprofFileReporter(t *testing.T) {
 	}
 	if !schedVals[5_000_000] || !schedVals[2_000_000] {
 		t.Errorf("sched value slot does not carry on_sched_ns: %v", kinds["sched"])
+	}
+}
+
+// fillScopeTypes writes SCOPE_CONFIG (0x0B, newest 48-byte shape), VM_STAT
+// (0x0C), and MSG_FLOW (0x0D) records. SCOPE_CONFIG/VM_STAT are JSONL-only
+// (see drain.go's dispatch); MSG_FLOW also goes through the
+// pprof-bound path (holdOrReport), scaled by this SCOPE_CONFIG's
+// recv_sample_shift == 6, once its pid_key's PROC_META settles (here: never,
+// so it settles via the fallback naming after heldMaxCycles).
+func fillScopeTypes(t *testing.T, f *fixture) {
+	t.Helper()
+	f.mustWrite(t, 0, encScopeConfig(48, scopeConfigFlagActive, tK, tU,
+		12, 50_000, 3_000_000, 4096, 2048, 8, 1000, 500, 6, 200, 0, 0, 0, 0, 0, 0))
+	f.mustWrite(t, 0, encVMStat(vmStatFlagMemoryValid, tK+1, tU+1,
+		42, 3, 1000, 2000, 999_999, 128, 16, 300, 200, 50, 50, 7))
+	f.mustWrite(t, 1, encMsgFlow(tK+2, tU+2, 0x3003, 555))
+}
+
+// TestPipelineScopeTypes: SCOPE_CONFIG/VM_STAT never reach the reporter (they
+// carry no pid_key stack to synthesize) and go to JSONL with their ABI-named
+// snake_case fields intact. MSG_FLOW is different: it always reaches
+// JSONL too, but ALSO settles into one pprof-bound sample, scaled by the
+// SCOPE_CONFIG's recv_sample_shift.
+func TestPipelineScopeTypes(t *testing.T) {
+	f := newFixture(t, 2, 4096)
+	fillScopeTypes(t, f)
+	seg := f.mustSegment(t)
+
+	mock := &mockReporter{}
+	d := newTestDrainer(t, seg, mock, t.TempDir(), testPID)
+	d.drainOnce()
+
+	if len(mock.traces) != 0 {
+		t.Fatalf("scope/vm_stat/msg_flow reached the reporter before settling: %d traces",
+			len(mock.traces))
+	}
+
+	byType := map[string][]map[string]any{}
+	for _, obj := range readJSONL(t, d.jsonl) {
+		typ, _ := obj["type"].(string)
+		byType[typ] = append(byType[typ], obj)
+	}
+	for _, typ := range []string{"scope_config", "vm_stat", "msg_flow"} {
+		if len(byType[typ]) != 1 {
+			t.Fatalf("JSONL has %d %s lines, want 1 (all: %v)", len(byType[typ]), typ, byType)
+		}
+		for _, key := range []string{"ktime_ns", "unix_ns", "pid"} {
+			if _, ok := byType[typ][0][key]; !ok {
+				t.Errorf("%s line missing %q: %v", typ, key, byType[typ][0])
+			}
+		}
+	}
+
+	sc := byType["scope_config"][0]
+	if sc["send_sample_shift"].(float64) != 12 || sc["gc_threshold_words"].(float64) != 50_000 ||
+		sc["sched_threshold_ns"].(float64) != 3_000_000 || sc["sketch_capacity"].(float64) != 4096 ||
+		sc["mirror_capacity"].(float64) != 2048 || sc["topk_k"].(float64) != 8 ||
+		sc["memory_every"].(float64) != 1000 || sc["tick_ms"].(float64) != 500 ||
+		sc["recv_sample_shift"].(float64) != 6 || sc["recv_emit_threshold"].(float64) != 200 ||
+		sc["active"] != true || sc["payload_len"].(float64) != 48 {
+		t.Errorf("scope_config fields wrong: %v", sc)
+	}
+
+	vs := byType["vm_stat"][0]
+	if vs["context_switches"].(float64) != 42 || vs["run_queue_total"].(float64) != 3 ||
+		vs["io_in_bytes"].(float64) != 1000 || vs["io_out_bytes"].(float64) != 2000 ||
+		vs["reductions"].(float64) != 999_999 || vs["atom_count"].(float64) != 128 ||
+		vs["port_count"].(float64) != 16 || vs["mem_total"].(float64) != 300 ||
+		vs["mem_processes"].(float64) != 200 || vs["mem_binary"].(float64) != 50 ||
+		vs["mem_ets"].(float64) != 50 || vs["epoch"].(float64) != 7 ||
+		vs["memory_valid"] != true {
+		t.Errorf("vm_stat fields wrong: %v", vs)
+	}
+
+	mf := byType["msg_flow"][0]
+	if mf["pid_key"].(float64) != 0x3003 || mf["arrivals_raw"].(float64) != 555 {
+		t.Errorf("msg_flow fields wrong: %v", mf)
+	}
+
+	// shutdown's flushHeld converts the still-held MSG_FLOW record (its
+	// pid_key never got a PROC_META in this fixture) with the fallback
+	// naming -- one pprof-bound sample appears, scaled by the SCOPE_CONFIG
+	// that was already latestConfig when it settled.
+	d.shutdown()
+	if len(mock.traces) != 1 {
+		t.Fatalf("settled msg_flow reported %d traces, want 1", len(mock.traces))
+	}
+	if got := mock.traces[0].CustomLabels[labelBeamscopeKind].String(); got != "msg" {
+		t.Errorf("settled msg_flow beamscope_kind %q, want msg", got)
+	}
+	m := mock.metas[0]
+	if m.ValueKind != samples.ValueKindMsgs || m.Value != int64(555<<6) {
+		t.Errorf("settled msg_flow value=%d kind=%d, want %d/ValueKindMsgs",
+			m.Value, m.ValueKind, int64(555<<6))
 	}
 }
 
@@ -627,7 +767,7 @@ func TestRecordedFixtureV2(t *testing.T) {
 	// msacc was enabled for the whole recording (every record flagged valid)
 	// and genuinely produced data (busy schedulers show emulator time). NOTE:
 	// "every msacc-valid record has nonzero emulator_ns" is deliberately NOT
-	// asserted — this fixture disproves it: idle schedulers (all the dirty-IO
+	// asserted -- this fixture disproves it: idle schedulers (all the dirty-IO
 	// ones, and normal schedulers on quiet ticks) correctly report
 	// emulator_ns == 0 with sleep_ns ~= total_ns. 5 of 62 are nonzero here.
 	if msaccValid != byType["sched_util"] {

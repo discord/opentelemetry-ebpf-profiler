@@ -3,10 +3,11 @@
 
 package reporter // import "go.opentelemetry.io/ebpf-profiler/reporter"
 
-// PprofFileReporter is a Discord addition: an egress path that writes pprof
-// files to a local directory instead of shipping OTLP anywhere. It exists for
-// offline analysis, where the profile is an artifact to be sliced and diffed
-// after the fact rather than a stream to a backend.
+// pprofFileSink is the local egress's pprof-file backend: it writes pprof files
+// to a local directory instead of shipping OTLP anywhere. It exists for offline
+// analysis, where the profile is an artifact to be sliced and diffed after the
+// fact rather than a stream to a backend. Selected by LocalEgressConfig.Dir; the
+// socket backend is independent of it (see local_egress.go).
 //
 // Two properties are load-bearing for that use and are the reason this is not
 // the OTLP reporter with a different transport:
@@ -26,7 +27,6 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,7 +34,6 @@ import (
 	"github.com/google/pprof/profile"
 
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
-	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 	"go.opentelemetry.io/ebpf-profiler/support"
 )
@@ -55,6 +54,11 @@ const (
 	LabelContainerID = "container_id"
 	LabelOrigin      = "origin"
 	LabelOffTimeNs   = "off_time_ns"
+	// LabelErlangPidKey carries the raw Erlang pid Eterm of the process a BEAM
+	// scheduler was running when a CPU sample landed. It is the join key
+	// against every beam_scope JSONL record and PROC_META naming, so its
+	// spelling is a hard contract with the offline tooling.
+	LabelErlangPidKey = "erlang_pid_key"
 
 	unitNanoseconds = "nanoseconds"
 	// unitID marks a numeric label that identifies rather than measures (cpu, pid,
@@ -63,242 +67,156 @@ const (
 	unitID = "id"
 )
 
-// PprofFileConfig configures a PprofFileReporter.
-type PprofFileConfig struct {
-	// Dir is where profiles are written. Created if absent.
-	Dir string
-	// FlushInterval is how often a profile file is emitted. Each file covers
-	// one interval; windows finer than that are cut offline from the timestamps,
-	// so this is a file-size knob, not a resolution knob.
-	FlushInterval time.Duration
-	// SamplesPerSecond is the sampling frequency, used to derive the profile
-	// period. It must match the tracer's actual rate or every value in the file
-	// is scaled wrongly.
-	SamplesPerSecond int
-	// MaxBufferedSamples bounds memory between flushes. Samples beyond it are
-	// dropped and counted, and the count is reported in the next profile's
-	// comments: a profiler that silently truncates would make a window look
-	// quiet rather than lossy.
-	MaxBufferedSamples int
-	// ProcFS overrides /proc, for tests.
-	ProcFS string
-	// KeepPIDs and KeepComms, when non-empty, restrict what is buffered at all.
-	// This is a volume knob for a host-wide profiler; prefer filtering offline
-	// on the labels, which keeps one capture re-sliceable.
-	KeepPIDs  map[libpf.PID]struct{}
-	KeepComms map[string]struct{}
-}
-
+// Exported because the command-line help interpolates them: the flags are
+// registered with a zero default ("not specified", so the reporter picks), and
+// Go's flag package prints no "(default ...)" for a zero value, so without this
+// the numbers would exist in exactly one place and be documented in none.
 const (
-	defaultFlushInterval      = 10 * time.Second
-	defaultMaxBufferedSamples = 4 << 20
+	// DefaultPprofFlushInterval is the default LocalEgressConfig.FlushInterval.
+	DefaultPprofFlushInterval = 10 * time.Second
+	// DefaultPprofMaxBufferedSamples is the default
+	// LocalEgressConfig.MaxBufferedSamples.
+	DefaultPprofMaxBufferedSamples = 4 << 20
 )
 
-// PprofFileReporter implements Reporter by writing pprof files locally.
-type PprofFileReporter struct {
-	cfg PprofFileConfig
+// pprofFileSink buffers assembled samples and writes them out as pprof files.
+type pprofFileSink struct {
+	dir              string
+	flushInterval    time.Duration
+	samplesPerSecond int
+	maxBuffered      int
 
-	mu          sync.Mutex
-	events      []sampleEvent
+	mu sync.Mutex
+	// events holds the assembler's *sampleEvent, the SAME pointer the socket
+	// sink may also be holding: the assembler builds one per sample and
+	// local_egress.go fans that one value out. NOTHING MAY MUTATE A BUFFERED
+	// EVENT -- not this sink, not the socket sink, not the assembler after
+	// handing it over. It is read-only shared state, and build() below is the
+	// only reader here. Adding a "fix it up at flush time" write would silently
+	// change what a co-resident socket stream already emitted, or race it.
+	events      []*sampleEvent
 	windowStart time.Time
 
 	dropped atomic.Uint64
 	written atomic.Uint64
 
+	// lineage is the cache the assembler resolves against. This sink only reads
+	// its unresolved count, for the profile's comments: an ancestry filter can
+	// only be trusted as far as that number is small.
+	//
+	// That comment is the ONLY place the count is surfaced, so a socket-only
+	// run ships the `ancestry` label with no confidence signal at all (the v1
+	// wire has no field for it, and adding one is a v2 header). Noted rather
+	// than fixed: a consumer that needs it runs with -pprof-dir too.
 	lineage *lineageCache
+
+	// crossAttest, when non-nil, renders a co-resident backend's loss summary
+	// into this profile's comments, or "" when that backend lost nothing. It is
+	// set only when the socket backend is also enabled -- an archive can only
+	// attest to a stream that exists -- and it is a func rather than a
+	// *socketSink so this sink does not depend on the other's type.
+	crossAttest func() string
+
+	// started is set by start(). stopAndFlush must not wait on a flush loop
+	// that was never launched -- that wait never returns, and "Stop() hangs" is
+	// a bad way to learn a reporter was never started.
+	started atomic.Bool
 
 	stop chan struct{}
 	done chan struct{}
 }
 
-// sampleEvent is one raw sample, with its frames flattened out of the interned
-// representation so nothing keeps the tracer's caches alive.
-type sampleEvent struct {
-	frames      []frame
-	ktime       int64
-	unixNano    int64
-	pid, tid    libpf.PID
-	cpu         int
-	offTime     int64
-	origin      libpf.Origin
-	ppid        int
-	ancestry    string
-	comm        string
-	processName string
-	executable  string
-	containerID string
-	// labels carries trace custom labels; only populated for beamscope-origin
-	// samples (erlang_pid, bin_vheap_delta) so existing output is unchanged.
-	labels map[string]string
-}
-
-type frame struct {
-	function string
-	file     string
-	line     int64
-}
-
-// NewPprofFile constructs a reporter writing pprof files under cfg.Dir.
-func NewPprofFile(cfg PprofFileConfig) (*PprofFileReporter, error) {
-	if cfg.Dir == "" {
-		return nil, fmt.Errorf("pprof reporter: Dir is required")
-	}
-	if cfg.SamplesPerSecond <= 0 {
-		return nil, fmt.Errorf("pprof reporter: SamplesPerSecond must be positive, got %d",
-			cfg.SamplesPerSecond)
-	}
+func newPprofFileSink(cfg LocalEgressConfig, lineage *lineageCache) (*pprofFileSink, error) {
 	if cfg.FlushInterval <= 0 {
-		cfg.FlushInterval = defaultFlushInterval
+		cfg.FlushInterval = DefaultPprofFlushInterval
 	}
 	if cfg.MaxBufferedSamples <= 0 {
-		cfg.MaxBufferedSamples = defaultMaxBufferedSamples
+		cfg.MaxBufferedSamples = DefaultPprofMaxBufferedSamples
 	}
 	if err := os.MkdirAll(cfg.Dir, 0o755); err != nil {
-		return nil, fmt.Errorf("pprof reporter: %w", err)
+		return nil, fmt.Errorf("pprof egress: %w", err)
 	}
-	return &PprofFileReporter{
-		cfg:     cfg,
-		lineage: newLineageCache(cfg.ProcFS),
-		stop:    make(chan struct{}),
-		done:    make(chan struct{}),
+	return &pprofFileSink{
+		dir:              cfg.Dir,
+		flushInterval:    cfg.FlushInterval,
+		samplesPerSecond: cfg.SamplesPerSecond,
+		maxBuffered:      cfg.MaxBufferedSamples,
+		lineage:          lineage,
+		stop:             make(chan struct{}),
+		done:             make(chan struct{}),
 	}, nil
 }
 
-// ReportTraceEvent buffers one sample.
-func (r *PprofFileReporter) ReportTraceEvent(trace *libpf.Trace,
-	meta *samples.TraceEventMeta) error {
-	switch meta.Origin {
-	case support.TraceOriginSampling, support.TraceOriginOffCPU, support.TraceOriginProbe:
-	case support.TraceOriginBeamScope: // Discord: BEAM shm instrumentation (beamscope)
-	default:
-		return fmt.Errorf("skip reporting trace for %d origin: %w", meta.Origin, errUnknownOrigin)
+// consume buffers one assembled sample, or counts it as dropped when the buffer
+// is full. It never blocks on I/O: the file is written by the flush loop.
+func (s *pprofFileSink) consume(ev *sampleEvent) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.events) >= s.maxBuffered {
+		s.dropped.Add(1)
+		return
 	}
-	if len(r.cfg.KeepPIDs) > 0 {
-		if _, ok := r.cfg.KeepPIDs[meta.PID]; !ok {
-			return nil
-		}
+	if s.windowStart.IsZero() {
+		s.windowStart = time.Now()
 	}
-	if len(r.cfg.KeepComms) > 0 {
-		if _, ok := r.cfg.KeepComms[meta.Comm.String()]; !ok {
-			return nil
-		}
-	}
-
-	// Resolved on the buffering path, not at flush: by flush time a short-lived
-	// process is often gone, and its lineage with it.
-	lin := r.lineage.get(int(meta.PID))
-
-	ev := sampleEvent{
-		frames:      flatten(trace.Frames),
-		ppid:        lin.ppid,
-		ancestry:    lin.ancestryLabel(),
-		ktime:       meta.KTime,
-		unixNano:    int64(meta.Timestamp),
-		pid:         meta.PID,
-		tid:         meta.TID,
-		cpu:         meta.CPU,
-		offTime:     meta.OffTime,
-		origin:      meta.Origin,
-		comm:        meta.Comm.String(),
-		processName: strings.TrimSpace(meta.ProcessName.String()),
-		executable:  meta.ExecutablePath.String(),
-		containerID: meta.ContainerID.String(),
-	}
-	// Discord: beamscope samples carry their labels (erlang_pid,
-	// bin_vheap_delta) as trace custom labels; preserve them.
-	if meta.Origin == support.TraceOriginBeamScope && len(trace.CustomLabels) > 0 {
-		ev.labels = make(map[string]string, len(trace.CustomLabels))
-		for k, v := range trace.CustomLabels {
-			ev.labels[k.String()] = v.String()
-		}
-	}
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if len(r.events) >= r.cfg.MaxBufferedSamples {
-		r.dropped.Add(1)
-		return nil
-	}
-	if r.windowStart.IsZero() {
-		r.windowStart = time.Now()
-	}
-	r.events = append(r.events, ev)
-	return nil
+	s.events = append(s.events, ev)
 }
 
-// flatten resolves interned frames, leaf first as the tracer delivers them.
-func flatten(frames libpf.Frames) []frame {
-	out := make([]frame, 0, len(frames))
-	for _, handle := range frames {
-		f := handle.Value()
-		name := f.FunctionName.String()
-		file := f.SourceFile.String()
-		line := int64(f.SourceLine)
-		if name == "" {
-			// An unsymbolized native frame: name it by mapping and address so
-			// two different unknown frames do not collapse into one stack.
-			if f.Mapping.Valid() {
-				name = fmt.Sprintf("%s+0x%x", filepath.Base(f.Mapping.Value().File.Value().FileName.String()),
-					uint64(f.AddressOrLineno))
-			} else {
-				name = fmt.Sprintf("0x%x", uint64(f.AddressOrLineno))
-			}
-		}
-		out = append(out, frame{function: name, file: file, line: line})
-	}
-	return out
-}
-
-// Start begins the flush loop.
-func (r *PprofFileReporter) Start(ctx context.Context) error {
+// start begins the flush loop.
+func (s *pprofFileSink) start(ctx context.Context) {
+	s.started.Store(true)
 	go func() {
-		defer close(r.done)
-		ticker := time.NewTicker(r.cfg.FlushInterval)
+		defer close(s.done)
+		ticker := time.NewTicker(s.flushInterval)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-ticker.C:
-				if err := r.Flush(); err != nil {
-					log.Errorf("pprof reporter: flush failed: %v", err)
+				if err := s.Flush(); err != nil {
+					log.Errorf("pprof egress: flush failed: %v", err)
 				}
 			case <-ctx.Done():
-				if err := r.Flush(); err != nil {
-					log.Errorf("pprof reporter: final flush failed: %v", err)
+				if err := s.Flush(); err != nil {
+					log.Errorf("pprof egress: final flush failed: %v", err)
 				}
 				return
-			case <-r.stop:
-				if err := r.Flush(); err != nil {
-					log.Errorf("pprof reporter: final flush failed: %v", err)
+			case <-s.stop:
+				if err := s.Flush(); err != nil {
+					log.Errorf("pprof egress: final flush failed: %v", err)
 				}
 				return
 			}
 		}
 	}()
-	return nil
 }
 
-// Stop flushes and shuts the flush loop down.
-func (r *PprofFileReporter) Stop() {
-	select {
-	case <-r.stop:
-	default:
-		close(r.stop)
+// stopAndFlush shuts the flush loop down, which flushes what is buffered.
+func (s *pprofFileSink) stopAndFlush() {
+	if !s.started.Load() {
+		// No loop to stop, but there may be buffered samples, and discarding
+		// them silently is worse than writing one more file.
+		if err := s.Flush(); err != nil {
+			log.Errorf("pprof egress: final flush failed: %v", err)
+		}
+		return
 	}
-	<-r.done
+	select {
+	case <-s.stop:
+	default:
+		close(s.stop)
+	}
+	<-s.done
 }
 
-// Dropped reports how many samples were discarded for exceeding the buffer.
-func (r *PprofFileReporter) Dropped() uint64 { return r.dropped.Load() }
-
-// Flush writes the buffered samples as one pprof file and returns its path.
+// Flush writes the buffered samples as one pprof file.
 // A flush with nothing buffered writes no file and is not an error.
-func (r *PprofFileReporter) Flush() error {
-	r.mu.Lock()
-	events := r.events
-	start := r.windowStart
-	r.events = nil
-	r.windowStart = time.Time{}
-	r.mu.Unlock()
+func (s *pprofFileSink) Flush() error {
+	s.mu.Lock()
+	events := s.events
+	start := s.windowStart
+	s.events = nil
+	s.windowStart = time.Time{}
+	s.mu.Unlock()
 
 	if len(events) == 0 {
 		return nil
@@ -307,9 +225,9 @@ func (r *PprofFileReporter) Flush() error {
 	if start.IsZero() {
 		start = end
 	}
-	p := r.build(events, start, end)
-	seq := r.written.Add(1)
-	path := filepath.Join(r.cfg.Dir,
+	p := s.build(events, start, end)
+	seq := s.written.Add(1)
+	path := filepath.Join(s.dir,
 		fmt.Sprintf("profile-%06d-%d.pb.gz", seq, start.UnixNano()))
 	f, err := os.Create(path)
 	if err != nil {
@@ -324,12 +242,20 @@ func (r *PprofFileReporter) Flush() error {
 
 // build renders buffered samples as a pprof profile: one sample per event,
 // values in samples and nanoseconds, every label from the contract attached.
-func (r *PprofFileReporter) build(events []sampleEvent, start, end time.Time) *profile.Profile {
-	periodNs := int64(time.Second) / int64(r.cfg.SamplesPerSecond)
+func (s *pprofFileSink) build(events []*sampleEvent, start, end time.Time) *profile.Profile {
+	periodNs := int64(time.Second) / int64(s.samplesPerSecond)
 	p := &profile.Profile{
+		// Discord: five honest columns, one per measurement kind,
+		// instead of smuggling beamscope's alloc/sched/msgs values into the
+		// cpu-nanoseconds column. The presence of the "alloc" SampleType is
+		// the version marker a consumer checks before trusting column 1 as
+		// pure cpu-ns (see doc/discord-fork.md section 3.8).
 		SampleType: []*profile.ValueType{
 			{Type: "samples", Unit: "count"},
 			{Type: "cpu", Unit: unitNanoseconds},
+			{Type: "alloc", Unit: "words"},
+			{Type: "sched", Unit: unitNanoseconds},
+			{Type: "msgs", Unit: "count"},
 		},
 		DefaultSampleType: "cpu",
 		PeriodType:        &profile.ValueType{Type: "cpu", Unit: unitNanoseconds},
@@ -337,12 +263,19 @@ func (r *PprofFileReporter) build(events []sampleEvent, start, end time.Time) *p
 		TimeNanos:         start.UnixNano(),
 		DurationNanos:     end.Sub(start).Nanoseconds(),
 	}
-	if dropped := r.dropped.Load(); dropped > 0 {
+	if dropped := s.dropped.Load(); dropped > 0 {
 		p.Comments = append(p.Comments,
 			fmt.Sprintf("dropped %d samples exceeding MaxBufferedSamples=%d",
-				dropped, r.cfg.MaxBufferedSamples))
+				dropped, s.maxBuffered))
 	}
-	if unresolved := r.lineage.Unresolved(); unresolved > 0 {
+	if s.crossAttest != nil {
+		// Same rendering the socket's log line uses, so the archive and the log
+		// cannot state different numbers for one run.
+		if summary := s.crossAttest(); summary != "" {
+			p.Comments = append(p.Comments, summary)
+		}
+	}
+	if unresolved := s.lineage.Unresolved(); unresolved > 0 {
 		// An ancestry filter can only be trusted as far as this number is small:
 		// a process that died before /proc could be read has no lineage.
 		p.Comments = append(p.Comments,
@@ -376,23 +309,23 @@ func (r *PprofFileReporter) build(events []sampleEvent, start, end time.Time) *p
 		return loc
 	}
 
-	for i := range events {
-		ev := &events[i]
+	for _, ev := range events {
 		locations := make([]*profile.Location, 0, len(ev.frames))
 		for _, fr := range ev.frames {
 			locations = append(locations, location(fr))
 		}
-		s := &profile.Sample{
+		sm := &profile.Sample{
 			Location: locations,
-			Value:    []int64{1, periodNs},
+			// samples column is always 1; the four measurement columns
+			// (cpu/alloc/sched/msgs) start at 0 and exactly one is filled in
+			// below, per ev.origin (see the fill-rule switch).
+			Value:    []int64{1, 0, 0, 0, 0},
 			Label:    map[string][]string{},
 			NumLabel: map[string][]int64{},
 			NumUnit:  map[string][]string{},
 		}
-		s.NumLabel[LabelKTimeNs] = []int64{ev.ktime}
-		s.NumUnit[LabelKTimeNs] = []string{unitNanoseconds}
-		s.NumLabel[LabelTimestampNs] = []int64{ev.unixNano}
-		s.NumUnit[LabelTimestampNs] = []string{unitNanoseconds}
+		setNumLabel(sm, LabelKTimeNs, ev.ktime, unitNanoseconds)
+		setNumLabel(sm, LabelTimestampNs, ev.unixNano, unitNanoseconds)
 		// Identifier-valued numeric labels carry a unit, and it is not decoration:
 		// google/pprof's encoder DROPS a numeric label that is both zero-valued and
 		// unit-less, so an unlabelled `cpu` would silently swallow every sample taken
@@ -401,61 +334,131 @@ func (r *PprofFileReporter) build(events []sampleEvent, start, end time.Time) *p
 		// values ran 1..15 with 0 absent entirely, at 95.3% label coverage. pid and
 		// tid share the hazard and are only spared because neither is ever 0 for a
 		// sampled thread; giving them units too means that is not load-bearing.
-		s.NumLabel[LabelPID] = []int64{int64(ev.pid)}
-		s.NumUnit[LabelPID] = []string{unitID}
-		s.NumLabel[LabelTID] = []int64{int64(ev.tid)}
-		s.NumUnit[LabelTID] = []string{unitID}
-		s.NumLabel[LabelCPU] = []int64{int64(ev.cpu)}
-		s.NumUnit[LabelCPU] = []string{unitID}
+		setNumLabel(sm, LabelPID, int64(ev.pid), unitID)
+		setNumLabel(sm, LabelTID, int64(ev.tid), unitID)
+		setNumLabel(sm, LabelCPU, int64(ev.cpu), unitID)
 		if ev.ppid > 0 {
-			s.NumLabel[LabelPPID] = []int64{int64(ev.ppid)}
-			s.NumUnit[LabelPPID] = []string{unitID}
+			setNumLabel(sm, LabelPPID, int64(ev.ppid), unitID)
 		}
-		setString(s, LabelAncestry, ev.ancestry)
+		setString(sm, LabelAncestry, ev.ancestry)
 		if ev.offTime != 0 {
-			s.NumLabel[LabelOffTimeNs] = []int64{ev.offTime}
-			s.NumUnit[LabelOffTimeNs] = []string{unitNanoseconds}
+			setNumLabel(sm, LabelOffTimeNs, ev.offTime, unitNanoseconds)
 		}
-		setString(s, LabelComm, ev.comm)
-		setString(s, LabelProcessName, ev.processName)
-		setString(s, LabelExecutable, ev.executable)
-		setString(s, LabelContainerID, ev.containerID)
-		setString(s, LabelOrigin, originName(ev.origin))
-		// Discord: beamscope samples. The value channel (OffTime) carries the
-		// sample's own value (allocated words for beamscope_kind=alloc,
-		// on-scheduler nanoseconds for kind=sched): put it in the value slot
-		// and drop the misleading off_time_ns label. Numeric labels arrive as
-		// decimal strings in the custom labels; re-emit them as num labels,
-		// with units so zero values survive pprof encoding.
-		if ev.origin == support.TraceOriginBeamScope {
-			s.Value = []int64{1, ev.offTime}
-			delete(s.NumLabel, LabelOffTimeNs)
-			delete(s.NumUnit, LabelOffTimeNs)
-			for k, v := range ev.labels {
-				if unit, numeric := beamscopeNumLabelUnits[k]; numeric {
+		// Discord: 0 means the sample is not attributable to an
+		// Erlang process, and the label is omitted entirely rather than
+		// emitted as 0 -- a pid term is never 0, so "absent" and "pid 0" must
+		// not be made to look alike downstream. The value is an Eterm, not a
+		// count; int64 here is a bit-pattern carrier (pprof has no unsigned
+		// num label) and the reader must cast back to uint64.
+		if ev.erlangPidKey != 0 {
+			setNumLabel(sm, LabelErlangPidKey, int64(ev.erlangPidKey), unitID)
+		}
+		setString(sm, LabelComm, ev.comm)
+		setString(sm, LabelProcessName, ev.processName)
+		setString(sm, LabelExecutable, ev.executable)
+		setString(sm, LabelContainerID, ev.containerID)
+		setString(sm, LabelOrigin, originName(ev.origin))
+		// Discord: fill exactly one measurement column per origin.
+		// CPU-origin (sampling/probe) fills cpu-ns from the tracer's period.
+		// Off-CPU leaves cpu-ns at 0 -- off-scheduler time is not cpu time --
+		// and keeps carrying its value only in the off_time_ns label set
+		// above. Beamscope fills the column named by its ValueKind; the
+		// off_time_ns label-delete special case that used to live here is
+		// gone because beamscope no longer touches OffTime at all.
+		switch ev.origin {
+		case support.TraceOriginBeamScope:
+			switch ev.valueKind {
+			case samples.ValueKindAlloc:
+				sm.Value[2] = ev.value
+			case samples.ValueKindSchedNS:
+				sm.Value[3] = ev.value
+			case samples.ValueKindMsgs:
+				sm.Value[4] = ev.value
+			}
+		case support.TraceOriginOffCPU:
+			// cpu-ns column intentionally stays 0.
+		default: // TraceOriginSampling, TraceOriginProbe
+			// A NEW origin added upstream or here lands in this arm and silently
+			// becomes cpu-ns mass at the tracer's period, which is right only
+			// for something that really is a CPU sample. Any new origin must
+			// pick its value column deliberately -- add a case rather than
+			// inheriting this one.
+			sm.Value[1] = periodNs
+		}
+		// Discord: custom labels ride every origin now, which makes
+		// the traced process a co-author of this sample's label set. Two
+		// things follow, and neither was true while the loop was gated to
+		// beamscope:
+		//
+		//   - It runs AFTER the contract labels are assigned, so a custom key
+		//     spelled like one of them would overwrite the reporter's own
+		//     value. A Go service is free to set a pprof label called "comm"
+		//     or "origin"; the label contract is not.
+		//   - numLabelUnits names BEAMSCOPE's numeric labels. Applying it to
+		//     every origin means a Go service whose label happens to be
+		//     called "preempts" or "pause_ns" gets it silently converted to a
+		//     numeric label with a unit it never asked for.
+		//
+		// So: never overwrite a contract key, and only re-type numerics for
+		// the origin the mapping actually describes.
+		for k, v := range ev.labels {
+			if _, reserved := contractLabelKeys[k]; reserved {
+				continue
+			}
+			if ev.origin == support.TraceOriginBeamScope {
+				if unit, numeric := numLabelUnits[k]; numeric {
 					if n, err := strconv.ParseInt(v, 10, 64); err == nil {
-						s.NumLabel[k] = []int64{n}
-						s.NumUnit[k] = []string{unit}
+						setNumLabel(sm, k, n, unit)
 						continue
 					}
 				}
-				setString(s, k, v)
 			}
+			setString(sm, k, v)
 		}
-		p.Sample = append(p.Sample, s)
+		p.Sample = append(p.Sample, sm)
 	}
 	return p
 }
 
-// beamscopeNumLabelUnits names the beamscope custom labels that are numeric
-// and the unit each is emitted with (bin_vheap_delta stays a string label for
+// numLabelUnits names the labels that are emitted as pprof numeric labels and
+// the unit each carries. Every entry a lookup can reach is a beamscope custom
+// label arriving as a decimal string (bin_vheap_delta stays a string label for
 // compatibility with existing captures).
-var beamscopeNumLabelUnits = map[string]string{
-	"mbuf_words": "words",
-	"pause_ns":   unitNanoseconds,
-	"nswitches":  "count",
-	"preempts":   "count",
-	"yields":     "count",
+//
+// LabelErlangPidKey is the exception and is unreachable from that loop by
+// design: it is a contract key, so contractLabelKeys skips it before the
+// lookup, and its value comes from the meta field instead. It is listed anyway
+// so the unit it is written with lives next to the others rather than only at
+// its one call site.
+var numLabelUnits = map[string]string{
+	"mbuf_words":      "words",
+	"pause_ns":        unitNanoseconds,
+	"nswitches":       "count",
+	"preempts":        "count",
+	"yields":          "count",
+	LabelErlangPidKey: unitID,
+}
+
+// contractLabelKeys is every label name this sink assigns itself. A custom
+// label carrying one of these names is skipped rather than allowed to replace
+// the reporter's value: an offline filter on `comm` or `origin` has to mean the
+// kernel's comm and this reporter's origin, whatever the traced process puts in
+// its own pprof labels.
+var contractLabelKeys = map[string]struct{}{
+	LabelKTimeNs:      {},
+	LabelTimestampNs:  {},
+	LabelPID:          {},
+	LabelTID:          {},
+	LabelPPID:         {},
+	LabelAncestry:     {},
+	LabelComm:         {},
+	LabelProcessName:  {},
+	LabelExecutable:   {},
+	LabelCPU:          {},
+	LabelContainerID:  {},
+	LabelOrigin:       {},
+	LabelOffTimeNs:    {},
+	LabelErlangPidKey: {},
 }
 
 func setString(s *profile.Sample, key, value string) {
@@ -465,47 +468,10 @@ func setString(s *profile.Sample, key, value string) {
 	s.Label[key] = []string{value}
 }
 
-func originName(o libpf.Origin) string {
-	switch o {
-	case support.TraceOriginSampling:
-		return "sampling"
-	case support.TraceOriginOffCPU:
-		return "off_cpu"
-	case support.TraceOriginProbe:
-		return "probe"
-	case support.TraceOriginBeamScope: // Discord: BEAM shm instrumentation
-		return "beamscope"
-	default:
-		return fmt.Sprintf("origin_%d", o)
-	}
-}
-
-// ParsePIDList turns a comma-separated PID list into a set.
-func ParsePIDList(pids []int) map[libpf.PID]struct{} {
-	if len(pids) == 0 {
-		return nil
-	}
-	out := make(map[libpf.PID]struct{}, len(pids))
-	for _, pid := range pids {
-		out[libpf.PID(pid)] = struct{}{}
-	}
-	return out
-}
-
-// ParseCommList turns a list of process names into a set.
-func ParseCommList(comms []string) map[string]struct{} {
-	if len(comms) == 0 {
-		return nil
-	}
-	out := make(map[string]struct{}, len(comms))
-	for _, c := range comms {
-		if c == "" {
-			continue
-		}
-		out[c] = struct{}{}
-	}
-	if len(out) == 0 {
-		return nil
-	}
-	return out
+// setNumLabel writes a pprof numeric label. The unit is not decoration: see
+// unitID -- google/pprof drops a numeric label that is both zero-valued and
+// unit-less, so every num label written here carries one.
+func setNumLabel(s *profile.Sample, key string, value int64, unit string) {
+	s.NumLabel[key] = []int64{value}
+	s.NumUnit[key] = []string{unit}
 }

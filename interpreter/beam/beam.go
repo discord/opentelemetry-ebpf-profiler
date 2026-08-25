@@ -16,6 +16,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"unsafe"
 
 	"github.com/elastic/go-freelru"
@@ -57,6 +58,10 @@ type beamData struct {
 	etpPtrMask          uint64
 	etpHeaderSubtagMask uint64
 	etpHeapBitsSubtag   uint64
+	// schedSymbols and schedUnsupportedOnce serve per-sample Erlang process
+	// attribution (beam_sched.go). Zero-valued symbols disable the feature.
+	schedSymbols         schedSymbols
+	schedUnsupportedOnce sync.Once
 	// Sizes and offsets BEAM internal structs we need to traverse
 	vmStructs struct {
 		// ranges
@@ -132,6 +137,10 @@ type beamInstance struct {
 	stringCache          *freelru.LRU[libpf.Address, libpf.String]
 	framePointersEnabled bool
 
+	// schedTids are the kernel tids this instance put in beam_sched_tids, to
+	// be removed on Detach. Empty when attribution is disabled for this VM.
+	schedTids []libpf.PID
+
 	// prefixes is indexed by the prefix added to ebpf maps (to be cleaned up) to its generation
 	prefixes map[lpm.Prefix]uint32
 	// mappingGeneration is the current generation (so old entries can be pruned)
@@ -179,19 +188,14 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	// Double hack: when the emulator is built with LTO , the linker renames
 	// file-local symbols by appending a ".llvm.<hash>" suffix, so "r" appears
 	// as e.g. "r.llvm.5915997031394578193". Match either form.
-	var r libpf.Symbol
-	var rFound bool
-	ef.VisitSymbols(func(sym libpf.Symbol) bool {
-		if sym.Name == "r" || strings.HasPrefix(string(sym.Name), "r.llvm.") {
-			r = sym
-			rFound = true
-			return false
-		}
-		return true
-	})
-	if !rFound {
+	//
+	// Resolved together with the (best-effort) scheduler symbols below in one
+	// VisitSymbols pass -- see resolveSymbols in beam_sched.go.
+	resolved := resolveSymbols(ef)
+	if !resolved.rFound {
 		return nil, fmt.Errorf("symbol 'r' not found")
 	}
+	r := resolved.r
 
 	// "the_active_code_index" symbol is from:
 	// https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/code_ix.c#L46
@@ -230,6 +234,9 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 		beamNormalExit:     libpf.Address(beamNormalExit.Address),
 		ertsAtomTable:      uint64(atomTable.Address),
 		etpPtrMask:         npsr.Uint64(etpPtrMask, 0),
+		// Best effort: these four are only needed for the erlang_pid_key
+		// label, so a stripped emulator loses the label and nothing else.
+		schedSymbols: resolved.sched,
 	}
 	if d.otpRelease == 25 {
 		if address, err := ef.LookupSymbolAddress("__jit_debug_descriptor"); err == nil {
@@ -472,6 +479,10 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		return nil, err
 	}
 
+	// Per-sample Erlang process attribution (Discord). Purely additive: it
+	// either validates and enables, or logs and leaves the map untouched.
+	schedTids := d.enableSchedAttribution(ebpf, pid, bias, rm)
+
 	return &beamInstance{
 		pid:                  pid,
 		data:                 d,
@@ -482,6 +493,7 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		mfaNameCache:         mfaNameCache,
 		stringCache:          stringCache,
 		framePointersEnabled: data.Frame_pointers_enabled,
+ schedTids: schedTids,
 	}, nil
 }
 
@@ -550,7 +562,11 @@ func (i *beamInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler, _ repor
 	return nil
 }
 
-func (i *beamInstance) Detach(interpreter.EbpfHandler, libpf.PID) error {
+func (i *beamInstance) Detach(ebpf interpreter.EbpfHandler, _ libpf.PID) error {
+	// See support/ebpf/beam_sched.h's identity section for why this delete
+	// is keyed on (tgid, tid) rather than tid alone.
+	disableSchedAttribution(ebpf, i.schedTids, i.pid)
+	i.schedTids = nil
 	return nil
 }
 

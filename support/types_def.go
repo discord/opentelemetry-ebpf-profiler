@@ -132,6 +132,7 @@ type UnwindInfo C.UnwindInfo
 
 type ApmIntProcInfo C.ApmIntProcInfo
 type BEAMProcInfo C.BEAMProcInfo
+type BeamSchedInfo C.BeamSchedInfo
 type DotnetProcInfo C.DotnetProcInfo
 type GoRuntimeOffsets C.GoRuntimeOffsets
 type HotspotProcInfo C.HotspotProcInfo

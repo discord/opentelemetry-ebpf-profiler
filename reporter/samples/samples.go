@@ -14,6 +14,8 @@ KTime int64
 ProcessName libpf.String
 Origin uint16
 OffTime int64
+ ErlangPidKey uint64
+ ValueKind uint8
 	Comm           libpf.Comm
 	ExecutablePath libpf.String
 	ContainerID    libpf.String
@@ -32,6 +34,16 @@ OffTime int64
 	SpanID         libpf.APMSpanID
 	TraceID        libpf.APMTraceID
 }
+
+// ValueKind* name the units TraceEventMeta.Value can carry. ValueKindNone
+// means the sample does not use this channel (its value, if any, lives
+// elsewhere, e.g. OffTime for off-CPU samples).
+const (
+	ValueKindNone    uint8 = 0
+	ValueKindAlloc   uint8 = 1
+	ValueKindSchedNS uint8 = 2
+	ValueKindMsgs    uint8 = 3
+)
 
 // TraceEvents holds known information about a trace.
 type TraceEvents struct {

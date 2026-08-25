@@ -8,21 +8,43 @@ is destined for the mainline OTel package) and **sampling semantics** (we
 expect to modify how and when samples are taken). It also documents the BEAM
 interpreter work, which is the reason the fork exists.
 
-Line references are against fork HEAD `e86db84`.
+Line references below are approximate and move with the fork's HEAD: this doc
+is maintained across an active hackweek series of tasks (beamscope interpreter,
+pprof/socket egress, ...), not pinned to one commit. For "what changed and
+when", `git log --oneline e86db84..HEAD` is more reliable than any SHA named
+here.
 
 ## 1. What the fork changes
 
-Two commits on top of a recent upstream `main`:
+Two commits carry the upstream-facing BEAM/OTP unwinder lineage on top of a
+recent upstream `main`:
 
 | Commit | What it does |
 |---|---|
 | `d97b69a` "Merge forked OTP 25 support into main" | BEAM/Erlang unwinder support for OTP 25-27 (upstream lineage targeted 27/28 only): `interpreter/beam/beam.go`, a new `libpf` frame type, and small `host`/`tracer` compat shims. ~200 lines across 4 files. |
 | `e86db84` "Add hack to find the 'r' symbol table when LTO is enabled" | LTO builds rename the file-local `r` symbol (BEAM's module ranges table) to `r.llvm.<hash>`; the loader now matches both spellings (`interpreter/beam/beam.go:165-180`). |
 
-Everything else is upstream. That is deliberate: the smaller the delta, the
-cheaper the rebase. New Discord-specific code (a custom reporter, sampling
-changes) should be added as *new files* where possible, not edits to upstream
-ones.
+Everything on top of those two is Discord-specific and grows with each
+hackweek task: the beamscope interpreter plugin (`interpreter/beamscope/`),
+the pprof-file and socket egress paths (`reporter/pprof_file_reporter.go`,
+`reporter/socket_sink.go`), and this doc's own sections 3.5 onward. That
+growing set is mostly additive -- new files and new reporter methods, not
+edits to upstream ones -- so the rebase surface against upstream `main` stays
+close to the two commits above.
+
+One change breaks that rule and is worth knowing about before a rebase. The
+per-sample attribution (section 3.9, `erlang_pid_key`) needed a new field on
+the eBPF `Trace` struct
+and therefore touches upstream files along its whole path:
+`support/ebpf/types.h`, `support/ebpf/tracemgmt.h`, `support/ebpf/extmaps.h`,
+`support/types_def.go` (and the regenerated `support/types.go`),
+`libpf/trace.go`, `tracer/tracer.go`, `processmanager/manager.go`,
+`processmanager/ebpf/ebpf.go`, `tools/coredump/ebpf{maps,helpers}.go`, and
+`interpreter/types.go` -- the last of which **adds two methods to the
+`interpreter.EbpfHandler` interface**, so any out-of-tree implementation of it
+must grow them too. Each edit is a handful of lines next to an existing one
+(the `offtime` field, the `OffTime` copy, the `beam_procs` map), so the
+conflicts are mechanical, but they are not zero.
 
 ### Known consumers
 
@@ -159,13 +181,22 @@ Given the goal -- profiles as local artifacts consumed by our own tooling,
 with externally-driven window cuts -- option A is the right default, with
 `ExtraSampleAttrProd` carrying window/iteration identity.
 
-### 3.5 What was actually built: `PprofFileReporter`
+### 3.5 What was actually built: the local egress
 
-`reporter/pprof_file_reporter.go` implements option A. Consumed by
+`reporter/local_egress.go` (`LocalEgressReporter`) plus its pprof backend in
+`reporter/pprof_file_reporter.go` implement option A. Consumed by
 `misc/users/sanchda/hackweek_2026/profile_diff/` in the monorepo, which slices
 these files into per-run windows and diffs them.
 
-Enable it with `-pprof-dir`; the agent then never dials a collection agent.
+The local egress assembles each sample ONCE -- frames flattened, lineage
+resolved on the reporting path, keep filters and comm trim applied -- and fans
+that one `sampleEvent` out to whichever backends are enabled: pprof files
+(`-pprof-dir`), the socket stream (`-socket-egress`, section 3.7), or both.
+Either backend runs without the other; with neither, the agent ships OTLP as
+upstream does.
+
+Enable pprof files with `-pprof-dir`; with either local backend the agent never
+dials a collection agent.
 Other flags: `-pprof-flush-interval` (default 10s), `-pprof-max-buffered-samples`,
 `-pprof-keep-pids`, `-pprof-keep-comms`. Wiring is in a new root-level
 `pprof_egress.go`, so `main.go` and `cli_flags.go` each gained one call.
@@ -198,10 +229,8 @@ library in isolation: `cpu=0` with no unit is absent after a round trip,
 95.3% label coverage.
 
 **Resolved 2026-08-20 by giving `cpu`, `pid`, `tid` and `ppid` the unit `id`.**
-An earlier revision of this section decided to leave it unfixed and document it,
-on the grounds that emitting the unit is "a silent format change mid-dataset".
-That objection is correct about the cost but is answered rather than overridden
-by the fix, because **the unit is itself the version marker**:
+Emitting the unit does change the format mid-dataset, but detectably, because
+**the unit is itself the version marker**:
 
     NumUnit["cpu"] present  -> post-fix capture; a missing `cpu` means genuinely
                                missing, and cpu 0 is present as cpu 0
@@ -242,6 +271,538 @@ gave us:
 - it is immune to NTP steps and `settimeofday`.
 
 Both stamps are emitted, so nothing that wants wall clock loses it.
+
+### 3.7 Socket egress: the same samples, streamed live
+
+`reporter/socket_sink.go`. Enable with `-socket-egress <path>`. It is
+INDEPENDENT of `-pprof-dir`: socket-only, pprof-only and both all work, and with
+both **pprof files keep being written, unchanged**. Consumed by
+`profile_store/crates/pstore-ingest` in the monorepo.
+
+**Why it exists.** The pprof reporter flushes on a timer (5s in the harness)
+but fuzzer iterations run 1-3s, so an iteration can sit entirely inside one
+flush and per-iteration windows cannot be cut. The flush interval is a
+file-size knob, not a resolution knob, and no offline slicing recovers a window
+that was never a window. The socket path removes the file-flush latency floor:
+measured sample-to-queryable is p50 9.95ms / p99 30.3ms.
+
+**Why it has no decode of its own.** The local egress's assembler has already
+resolved everything that matters into one `sampleEvent` -- frames flattened out
+of the interned tables, lineage read while the process still exists,
+comm/container/pid/tid/ktime -- and this sink emits from that exact value. That
+is what makes the two paths structurally identical rather than merely intended
+to agree: there is no second decode to drift. **Do not give the socket its own
+decode.** (It used to be a field inside the pprof reporter, reading that
+reporter's buffer-path event; that is why it could not run without
+`-pprof-dir`.)
+
+**Latency.** Every sample is flushed to the socket as it is written, so the
+producer-side floor is one write syscall, not a flush period.
+`-socket-egress-flush-interval` survives only as a safety net (nothing may sit
+in the write buffer indefinitely) and normally finds an empty buffer. The write
+deadline that unwedges a consumer which accepts but never reads has its own
+knob, `-socket-egress-write-timeout` (default 1s, clamped to 250ms..5s); it used
+to be 20x the flush interval, a derivation that stopped meaning anything once
+records no longer wait for a flush.
+
+**It never blocks the agent.** `offer()` is a non-blocking channel send;
+everything past the channel is one writer goroutine. A slow or absent consumer
+costs samples, not latency -- the alternative is the profiler stalling the box
+it is measuring. Measured: with the consumer reading nothing for 1.5s and a
+256-slot ring, 40,000 produced / 2,161 emitted / 37,839 dropped, and the
+sampling path never stalled.
+
+**It is never silently lossy.** Every drop is counted, the count rides on the
+wire next to the gap it describes, the absolute totals are restated
+periodically, and -- when the pprof backend is also enabled -- they are written
+into the pprof file's `Comments` so the archive and the stream cross-attest. In
+a socket-only run there is no archive to attest to, so the STATS records and the
+loss warning carry the signal instead; no combination loses it.
+
+#### Wire format (version 1)
+
+All integers **little-endian**. Consumer listens, agent dials and reconnects.
+The normative copy of these constants is `reporter/socket_sink.go`; the
+consumer's mirror is `pstore-ingest/src/wire.rs`. Keep all three in step.
+
+A connection is a header followed by records:
+
+    <stream header, header_len bytes>
+    <record>*
+
+**Stream header, 32 bytes in v1:**
+
+| off | size | field |
+|---|---|---|
+| 0  | 8 | magic `PSTRSOK1` (ASCII, no terminator) |
+| 8  | 2 | `u16` version = 1 |
+| 10 | 2 | `u16` header_len = 32. A reader consumes exactly this many bytes, so a later version can grow the header without breaking framing. |
+| 12 | 4 | `u32` stream flags; bit 0 = frames are LEAF-FIRST (always set in v1) |
+| 16 | 4 | `u32` samples_per_second |
+| 20 | 4 | `u32` max_frames, the per-sample frame cap |
+| 24 | 8 | `i64` CLOCK_MONOTONIC ns at connection open |
+
+**Record:**
+
+    u32 payload_len   // bytes that follow, INCLUDING the rec_type byte
+    u8  rec_type
+    u8  payload[payload_len - 1]
+
+The length prefix is what makes an unknown `rec_type` skippable, so the format
+can grow without a flag day.
+
+**`rec_type = 1` STRDEF** -- one entry of the per-connection string table:
+
+| off | size | field |
+|---|---|---|
+| 0 | 4 | `u32` id, dense from 1. **Id 0 always means the empty string.** |
+| 4 | 4 | `u32` byte_len |
+| 8 | n | UTF-8 bytes, no terminator |
+
+A STRDEF always precedes the first record referencing it, because interning
+happens on the writer goroutine -- downstream of the only lossy point in the
+design -- so a reference can never dangle. The table resets on reconnect.
+Measured on a real 479,660-sample capture: 101,788 STRDEFs cover 5.8M frame
+references.
+
+**`rec_type = 2` SAMPLE** -- one raw sample, never aggregated. Fixed part 64 bytes:
+
+| off | size | field |
+|---|---|---|
+| 0  | 8 | `i64` ktime_ns (`bpf_ktime_get_ns`, CLOCK_MONOTONIC) |
+| 8  | 8 | `i64` unix_ns (derived CLOCK_REALTIME; carried, never compared against ktime) |
+| 16 | 8 | `i64` off_time_ns. **Meaningful only for `origin = 2` (off_cpu).** It reads 0 for `origin = 4` (beamscope): the two-column reporter smuggled a beamscope sample's own value through this field; the five-column one does not (see 3.8), so a v1 socket consumer sees beamscope samples with no value at all. |
+| 24 | 4 | `i32` pid |
+| 28 | 4 | `i32` tid |
+| 32 | 4 | `i32` cpu |
+| 36 | 4 | `u32` **dropped_since_prev** |
+| 40 | 4 | `u32` comm -> string id |
+| 44 | 4 | `u32` process_name -> string id |
+| 48 | 4 | `u32` executable -> string id |
+| 52 | 4 | `u32` container_id -> string id. **0 = no cgroup, meaning a HOST process** (dockerd, falco, kernel threads, the agent itself) -- never "missing data". |
+| 56 | 1 | `u8` origin: 1 sampling, 2 off_cpu, 3 probe, 4 beamscope. Numbered independently of libpf's so an upstream renumbering cannot silently relabel a capture. |
+| 57 | 1 | `u8` flags; bit 0 = frame list TRUNCATED |
+| 58 | 2 | `u16` n_frames |
+| 60 | 4 | `u32` reserved, must be 0 |
+
+**What v1 does NOT carry.** The fixed part has no room for them and no version
+bump was taken, so a socket consumer does not see: `value`/`valueKind` (section 3.8 -- so beamscope samples arrive valueless, as noted for
+`off_time_ns` above), `erlang_pid_key` (section 3.9 -- a `u64` term
+does not fit the one spare `u32`), and custom labels of any kind. Anything
+needing those reads the pprof files, which carry all three. Adding them means a
+v2 header, not a reinterpretation of v1 bytes.
+
+This is also why `-beamscope` requires `-pprof-dir` and is NOT satisfied by
+`-socket-egress` alone: a socket-only beamscope run would start clean and then
+stream beamscope samples stripped of every beamscope-specific field.
+
+then `n_frames` x 12 bytes, **leaf-first** (as the tracer delivers them and as
+the pprof writer orders `Location`): `u32 func_str`, `u32 file_str`, `i32 line`.
+A consumer building a root-first folded key reverses.
+
+**`rec_type = 3` STATS** -- the producer's counters, 80 bytes: `i64 ktime_ns`,
+`i64 unix_ns`, then `u64` x 8: produced, emitted, dropped_ring, dropped_nosock,
+truncated_frames, bytes_written, strings_defined, connect_errors.
+
+Emitted right after the header (so a consumer attaching mid-run learns exactly
+what it missed), periodically, and immediately before a clean close.
+`produced >= emitted + dropped_ring + dropped_nosock` **always**; equality holds
+only at a quiescent point, because `produced` is incremented on the sampling
+path while STATS is written by the serializing goroutine. The difference is
+in-flight samples, and at the FINAL stats it must be zero -- anything else is
+samples lost at close without being counted as dropped.
+
+#### Truncation is described twice, on purpose
+
+- **Samples lost** -- `SAMPLE.dropped_since_prev` puts the count next to the gap
+  it describes; STATS carries the exact absolute total. Per-record attribution
+  is exact to within one writer iteration, the total is exact.
+- **Frames lost** -- the `FRAMES_TRUNCATED` sample flag. The pprof path never
+  truncates, so such a sample is NOT comparable with its pprof twin, and a
+  consumer asserting equivalence must refuse a stream carrying any.
+
+#### Byte budget, measured
+
+231.9 B/sample on the wire over a real 65,021-sample capture (214.2 in SAMPLE
+records, 17.7 amortised STRDEF), against 32.5 B/sample for the gzipped pprof of
+the same samples. The wire is 7.1x the archive because it is uncompressed and
+per-sample; at the profiler's measured 2,465 samples/s that is 572 KB/s over a
+unix socket, which is not a constraint.
+
+#### Equivalence is the acceptance test
+
+`profile_store/crates/pstore-ingest/tests/equivalence.rs` replays real captures
+through `ReportTraceEvent` with both egresses attached, folds the pprof with
+`profile_diff`'s own Go `internal/fold.Fold`, ingests the stream, and requires
+the two flame graphs to be EXACTLY equal -- same key set, bit-identical weights,
+in total and per container. Verified over 40 real captures / 479,660 samples /
+124,937 distinct stacks / 93 containers, under four fold projections. If the
+two paths ever disagree, that is the finding; do not relax the test.
+
+### 3.8 Honest multi-column values: retiring the `OffTime` smuggle
+
+Before this task, the pprof backend wrote a two-column `SampleType`
+(`{samples,count}`, `{cpu,nanoseconds}`) for **every** origin, but a
+beamscope-origin sample's own value (allocated words for a GC sample,
+on-scheduler nanoseconds for a SCHED_DELTA sample) was smuggled directly into
+that same cpu-nanoseconds slot: `s.Value = {1, ev.offTime}`, reusing
+`TraceEventMeta.OffTime` as a generic value channel. `SampleType` still said
+`cpu`/`nanoseconds`, so any consumer that summed column 1 across a mixed
+capture silently added alloc-word counts and cpu nanoseconds together.
+
+The fix is a wider, honest sample:
+
+```
+SampleType = [{samples,count}, {cpu,nanoseconds}, {alloc,words},
+              {sched,nanoseconds}, {msgs,count}]
+DefaultSampleType = "cpu"
+```
+
+`TraceEventMeta` gained a real value channel, separate from `OffTime`:
+`Value int64` and `ValueKind uint8` (`samples.ValueKindNone/Alloc/SchedNS/Msgs`).
+`OffTime` is once again exclusively the off-CPU sample's off-scheduler
+nanoseconds -- beamscope never sets it.
+
+**This is a real, unfixed loss on the socket path:** the v1 wire format (section 3.7) carries
+`off_time_ns` but not `value`/`valueKind`, so where a two-column-era socket
+consumer got a beamscope sample's value out of `off_time_ns`, it now gets 0
+and there is no other field holding it. The pprof files carry the value
+correctly; the socket stream does not. Fixing it needs a v2 header.
+
+The fill rule, exactly one measurement column non-zero per sample:
+
+| Origin | Value | Notes |
+|---|---|---|
+| CPU (sampling/probe) | `{1, periodNs, 0, 0, 0}` | unchanged from before this task |
+| off-CPU | `{1, 0, 0, 0, 0}` | off-scheduler time is not cpu time, so column 1 stays 0; the value still rides the `off_time_ns` label, as before |
+| beamscope, `ValueKindAlloc` | `{1, 0, value, 0, 0}` | GC_DELTA/GC_DELTA2, `beamscope_kind=alloc` |
+| beamscope, `ValueKindSchedNS` | `{1, 0, 0, value, 0}` | SCHED_DELTA, `beamscope_kind=sched` |
+| beamscope, `ValueKindMsgs` | `{1, 0, 0, 0, value}` | MSG_FLOW, `beamscope_kind=msg` (new this task) |
+
+MSG_FLOW's `value` is its raw arrival count scaled by the currently-latched
+SCOPE_CONFIG's `recv_sample_shift` at drain time (`ArrivalsRaw << shift`,
+`interpreter/beamscope/drain.go`'s `reportMsgFlow`); if no usable config is
+held yet (none seen, one that predates the field at `PayloadLen < 48`, or
+`recv_sample_shift >= 63` meaning receive tracing is off), no pprof sample is
+synthesized for that record -- the raw MSG_FLOW still reaches the JSONL
+sidecar either way, so nothing is silently dropped from the artifact, only
+from the pprof projection of it.
+
+**Version marker.** A consumer must not assume column 1 is pure cpu-ns
+without checking which shape it is reading: the presence of the `alloc`
+`SampleType` entry (`p.SampleType[2].Type == "alloc"`) identifies a five-column
+capture, exactly the same trick as the `id` unit on the `cpu` label in section
+3.5 -- a per-file, detectable version bump rather than a silent format change.
+A two-column file has only two `SampleType` entries and mixed alloc/sched mass
+in column 1.
+
+**Custom labels are no longer beamscope-only.** The local egress now
+carries `trace.CustomLabels` for every origin (previously gated to
+`TraceOriginBeamScope`), in preparation for a later task attaching labels to
+CPU-origin samples. The numeric-label unit table (`numLabelUnits`, named
+`beamscopeNumLabelUnits` when this task landed) was unchanged at the time; no
+CPU-origin numeric labels existed yet. Section 3.9 adds the first one.
+
+**Known follow-up:** `profile_diff`'s `fold` currently reads
+whatever sits in `Sample.Value[1]` and treats it as cpu-nanoseconds
+unconditionally. Against a five-column capture that is still correct for
+CPU/off-CPU samples (columns 0/1) but silently reads zero for every beamscope
+sample (whose mass moved to columns 2-4) instead of erroring -- the opposite
+failure mode from the pre-fix mixing bug, but still wrong for anyone folding a
+mixed capture. `fold` needs to select the cpu column by `SampleType` name
+before consuming new captures (tracked as a later task). Any capture taken
+between this task landing and that fix should be scored only against a `fold`
+that has picked up the name-based column selection, not blindly re-run through
+the old positional one.
+
+### 3.9 Per-sample Erlang process attribution: the `erlang_pid_key` label
+
+A CPU sample taken inside a BEAM VM tells you which C stack the emulator was
+executing. It does not tell you **which Erlang process** that work belonged to,
+and in a VM running hundreds of thousands of processes that is the only
+attribution anybody actually wants. Section 3.9 adds it: every CPU-origin sample
+whose thread is a BEAM scheduler carries a numeric pprof label
+
+```
+erlang_pid_key  <raw Eterm>   unit: id
+```
+
+which is the same 64-bit pid term beam_scope stamps on every JSONL record and
+PROC_META name, so a capture and a beam_scope sidecar join on it directly.
+(The fold-side naming join is a later task.)
+
+#### Why the read is coherent
+
+At sample time the eBPF program reads `esdp->current_process` for the
+scheduler thread it interrupted, and dereferences it to
+`Process.common.id`.
+
+The perf interrupt runs on the CPU that is executing that scheduler thread,
+and the **only** writer of `current_process` is that same thread
+(`erl_process.c`: `esdp->current_process = p;` in `schedule()`, and the
+`= NULL` stores in the exit paths, all executed by the scheduler itself). We
+are stopped inside it. So the read is quiescent: there is no concurrent writer
+to tear against, and no lock to take.
+
+What remains is staleness, bounded by dispatch latency -- the window between a
+scheduler picking a process and assigning the field. Three checks turn that
+window, and the identity problem below it, into a *missing* label instead of a
+*wrong* one:
+
+- **null check.** `current_process == NULL` means the scheduler is between
+  processes. No label.
+- **pid tag check.** `(id & 0xF) != 0x3` means the word is not an internal pid
+  (`_TAG_IMMED1_PID`, `erl_term.h`). A torn or half-initialised
+  `Process` cannot pass it. No label.
+- **tgid check.** `beam_sched_tids` is keyed by **global kernel tid**, and
+  kernel tids are reused. Coherence and tagging say nothing about *whose*
+  address space we are reading: if a `Detach` is ever missed -- a dropped
+  process-exit notification, which is an unbounded window -- an unrelated
+  thread can inherit a mapped tid, and then both reads happen at a dead VM's
+  addresses inside the new process. Those addresses may well be mapped, and a
+  word passes the tag check roughly 1 in 16 times, so this is exactly the
+  plausible-but-wrong label everything else here is built to avoid. So each
+  entry carries the tgid it was written for (in what used to be `BeamSchedInfo`
+  padding, so no ABI size change) and `beam_stamp_current_process` bails when
+  the sampled pid is not that one. Without this binding the "never a wrong
+  label" claim would be false.
+
+Zero is never emitted: `erlangPidKey == 0` omits the label entirely, so
+"unattributable" and "pid 0" are not made to look alike downstream.
+
+CPU-origin only. Off-CPU and probe traces are not "what this scheduler is
+running now", so stamping `current_process` on one would be a wrong label
+rather than a missing one; `collect_trace` gates on `origin == TRACE_SAMPLING`.
+
+#### The tripwire, and why the stride is measured rather than tabulated
+
+All version knowledge lives in user space (`interpreter/beam/beam_sched.go`);
+the eBPF side (`support/ebpf/beam_sched.h`) does two pointer reads and a tag
+check and has no way to fail safely, so it is never given a choice. At attach
+the interpreter:
+
+1. resolves `erts_aligned_scheduler_data`,
+   `erts_aligned_dirty_cpu_scheduler_data`, `erts_no_schedulers` and
+   `erts_no_dirty_cpu_schedulers` from `beam.smp`'s `.symtab` (best effort: a
+   stripped emulator simply loses the label);
+2. scans `/proc/<pid>/task/*/comm` for scheduler threads;
+3. **validates the layout before writing a single map entry**;
+4. writes one `beam_sched_tids` entry per validated scheduler tid, keyed by
+   kernel tid.
+
+The invariant the tripwire uses is fixed at VM start and never changes
+(`erl_process.c`, `init_scheduler_data(esdp, ix+1, ...)` for every `ix`,
+L5912-L5934 at OTP-25.3.2.7). It gives **two** constraints per scheduler, not
+one -- whichever of the two number fields is the index, the other is
+explicitly zeroed:
+
+| array | invariant |
+|---|---|
+| `erts_aligned_scheduler_data[i]` | `.no == i+1` **and** `.dirty_no == 0` (L5931-L5932) |
+| `erts_aligned_dirty_cpu_scheduler_data[i]` | `.dirty_no == i+1` **and** `.no == 0` (L5913, L5920) |
+
+Requiring it across the whole array also *derives* the array stride, which is
+the part that cannot be honestly tabulated.
+`sizeof(ErtsAlignedSchedulerData)` is dominated by `ErtsAuxWorkData` and
+`ErtsAtomCacheMap` and depends on build-time macros; it measured **41728
+bytes** on OTP 25.3.2.7 / erts-13.2.2.4 (nix, x86_64), a number no amount of
+header reading would have produced with confidence. So `probeAlignedStride`
+walks candidate strides in 64-byte steps (`ERTS_ALC_CACHE_LINE_ALIGN_SIZE`)
+looking for one that satisfies the invariant everywhere.
+
+**Acceptance requires uniqueness, and this matters most exactly where the
+probe is weakest.** At `n == 2` the search sees only `esdp[1]`, so the whole
+question reduces to "is there a 64-aligned word that looks like scheduler 2?"
+-- asked of several hundred words *inside scheduler 0's own struct*, where a
+small integer like 2 is entirely plausible. Both defences exist for that case:
+
+- the second, zeroed number field, which a stray `2` in unrelated data has no
+  reason to be accompanied by; and
+- a full scan of the candidate range, accepting only if **exactly one** stride
+  matches. Two matches disables the feature rather than picking one.
+
+Uniqueness cannot reject the true stride `S` **of a homogeneous array**: any
+multiple `k*S` reads `esdp[k*i]` at index `i`, whose index field is `k*i+1`,
+differing from `i+1` for every `i >= 1`. So no multiple of `S` can also match,
+and a second match can only be an unrelated coincidence -- which is precisely
+the thing that must not be silently resolved in favour of a guess. (Earlier
+revisions of this section claimed the *first* match was provably the true
+stride. That was only true across multiples of `S`, which is not the whole
+candidate set.)
+
+The residual cost of that strictness is that a 2-scheduler VM can occasionally
+disable itself on a coincidence. That is the intended direction; a missing
+label is recoverable, a wrong pid is not. `TestProbeAlignedStride` pins all
+three outcomes (true stride accepted, half-decoy rejected by the zero field,
+full decoy disabling) against a synthetic address space.
+
+#### Only the normal array may be probed (the dirty-IO aliasing)
+
+"Homogeneous" above is load-bearing, and the dirty arrays are not.
+`erts_aligned_scheduler_data` is exactly `erts_no_schedulers` elements indexed
+`1..n` with no gaps. The dirty arrays share **one** allocation of
+`no_dirty_cpu + no_dirty_io` elements --
+
+```c
+erts_aligned_dirty_io_scheduler_data =
+    &erts_aligned_dirty_cpu_scheduler_data[no_dirty_cpu_schedulers];
+```
+
+(`erl_process.c` L6193-L6212 @OTP-25.3.2.7) -- and the IO half **restarts
+`dirty_no` at 1**. Probing the dirty-CPU array therefore has a *systematic*
+false match at `k = no_dirty_cpu + 1`: element `k` is `dirty_io[1]`, whose
+`dirty_no` is 2 and whose `no` is 0, indistinguishable from `dirty_cpu[1]` by
+any local test. This is not hypothetical -- adding the uniqueness rule
+immediately produced, on a real VM at `+SDcpu 2:2` (10 dirty-IO schedulers by
+default):
+
+```
+ambiguous scheduler array stride: both 41728 and 125184 satisfy the layout
+tripwire for 2 schedulers
+```
+
+`125184 == 3 * 41728`, exactly `(no_dirty_cpu + 1) * S`. So the dirty-CPU array
+is never probed: the stride is measured on the homogeneous normal array and the
+dirty array is **verified** at it (`verifyDirtyCPUArray`), which is a full
+tripwire over every dirty-CPU element, just at a known stride rather than a
+searched one. If the normal array has only one scheduler there is no measured
+stride, and dirty-CPU attribution with more than one dirty scheduler is
+disabled rather than guessed. `TestVerifyDirtyCPUArray` reproduces the aliasing
+synthetically so this does not depend on having a VM to hand.
+
+A single scheduler (`+S 1`) carries no discriminating information, and needs
+none -- only `esdp[0]` is ever addressed, and it is still checked against both
+constraints. The probe reports `strideUndetermined` (0) in that case rather
+than a plausible-looking number it did not measure; `(num-1) * 0` addresses
+the base either way.
+
+#### Offsets table
+
+Hand-derived from `erts/emulator/beam/erl_process.h` and confirmed empirically
+against a live OTP 25 VM (`TestBeamSchedLiveAttach`). The prefix of
+`struct ErtsSchedulerData_` is byte-identical at **OTP-25.3.2.7**,
+**OTP-26.2.5.9**, **OTP-27.3.4.6** and **OTP-28.0.2**, so one row covers all
+four:
+
+| field | offset | derivation |
+|---|---|---|
+| `current_process` | 168 | 7 pointers/`ethr_tid` (56) + `ErtsThrPrgrData` (104) + `ssi` (8) |
+| `no` | 184 | `current_process` (8) + `ErtsSchedType type` (4) + 4 pad |
+| `dirty_no` | 192 | `no` (8) |
+
+`ethr_tid` is `pthread_t` (8 on LP64,
+`erts/include/internal/ethread.h:132`). `ErtsThrPrgrData` is 104 bytes; its
+only conditional member (`is_delaying`) sits behind `ERTS_ENABLE_LOCK_CHECK`,
+a debug build option, and the struct is unchanged across all four tags
+(`erts/emulator/beam/erl_thr_progress.h`). `Process.common.id` is at offset 0:
+`struct process` opens with `ErtsPTabElementCommon common; /* *Need* to be
+first in struct */` (`erl_process.h:1007`) whose first member is `Eterm id`
+(`erl_ptab.h`).
+
+OTP 25 (erts 13.x) is the first-class, required target. 26/27/28 are listed
+because the same derivation holds byte-for-byte at those tags; anything else
+is absent from the table and cleanly disables.
+
+#### Disable semantics
+
+Every failure is a disable, logged, never a guess and never a partial state:
+
+| condition | effect |
+|---|---|
+| OTP release not in `schedOffsetsByOTP` | feature off for that VM, warned once per `beamData` |
+| `beam.smp` stripped of the scheduler symbols | feature off for that VM, warned once per `beamData` |
+| tripwire fails on the normal array (wrong offsets, unreadable memory, implausible `erts_no_schedulers`) | feature off for that VM, warned; **no map entries written** -- the validation completes before the first write |
+| tripwire fails on the dirty-CPU array only | dirty-CPU attribution off, normal schedulers unaffected |
+| more than one dirty-CPU scheduler but the normal array has only one (no measured stride) | dirty-CPU attribution off, normal schedulers unaffected |
+| no scheduler threads found in `/proc` | feature off for that VM, **warned** (schedulers exist before any Erlang code runs, so this should be impossible and would otherwise be a silent loss) |
+| individual map update fails | that tid skipped; the rest proceed |
+| a stale entry survives (missed `Detach`) and its tid is reused | no label on the unrelated thread: the entry's tgid does not match the sampled pid (see the tgid check above). Not a disable -- a per-sample miss |
+
+Dirty-IO schedulers are deliberately never attributed: they are blocked in
+syscalls by construction, so a CPU sample on one is not Erlang execution.
+Dirty-CPU schedulers *are*, and they share the normal schedulers' struct and
+therefore their stride -- which is why the stride measured on the normal array
+is the one used to address them (see the dirty-IO aliasing above).
+
+On `Detach` the instance's tids are removed from `beam_sched_tids`. Kernel
+tids are reused; a leaked entry would eventually attribute an unrelated
+thread's samples through a dead VM's addresses.
+
+**`beam_sched_tids` is loaded unconditionally**, unlike `beam_procs`.
+`collect_trace` reads it and is inlined into `native_tracer_entry`, which is
+always loaded, so a map gated on `-tracers beam` would leave that program with
+an unresolvable map reference and the whole agent would fail to start without
+the BEAM tracer. It is `BPF_F_NO_PREALLOC` and empty on any host not running a
+BEAM, and it is only ever written from user space, so the non-preallocated
+allocation path is never entered from a sampling context.
+
+#### Thread comms are not what you would guess
+
+The scheduler thread names are `"<N>_scheduler"`,
+`"<N>_dirty_cpu_scheduler"`, `"<N>_dirty_io_scheduler"` (`erl_process.c`,
+`erts_snprintf(opts.name, ...)`), and the kernel truncates `comm` to 15 bytes,
+so the dirty ones arrive already cut. Observed on OTP 25.3.2.7 /
+erts-13.2.2.4, x86_64, `erl -noshell +S 4:4 +SDcpu 2:2`:
+
+```
+1_scheduler  2_scheduler  3_scheduler  4_scheduler
+1_dirty_cpu_sch  2_dirty_cpu_sch
+1_dirty_io_sche  2_dirty_io_sche ... 10_dirty_io_sch
+1_aux  0_poller  async_1  sys_msg_dispatc  sys_sig_dispatc  beam.smp
+```
+
+`parseSchedComm` therefore prefix-matches the dirty names and requires at
+least `dirty_c` before it will call one a dirty-CPU scheduler -- confusing
+`dirty_cpu` with `dirty_io` would index the wrong half of a shared allocation.
+There is no `erts_`-prefixed form on Linux.
+
+#### Where it shows up, and what did not change
+
+`Trace.erlang_pid_key` (eBPF) -> `libpf.EbpfTrace.ErlangPidKey` ->
+`samples.TraceEventMeta.ErlangPidKey` -> pprof num label, following the
+`KTime` precedent exactly (section 3.6). It is **not** a string
+`CustomLabel`: the eBPF custom-label array is a scarce fixed-size resource and
+a decimal string would be lossy to re-parse.
+
+Two things this task did not touch:
+
+- **The socket wire format (section 3.7) does not carry it.** Version 1's
+  fixed header has no room -- a `u64` term does not fit the one spare `u32` --
+  so a socket consumer that needs the attribution reads the pprof files. Same
+  gap as section 3.8's `value`/`valueKind`; both are listed under "What v1 does NOT
+  carry" in 3.7.
+- **The OTLP reporter does not emit it.** Only the local egress's pprof backend
+  does.
+
+#### Validating it end to end (needs root and a rebuilt tracer object)
+
+`TestBeamSchedLiveAttach` (`interpreter/beam/beam_sched_test.go`) covers the
+whole user-space half against a real VM without root -- it starts `erl` as a
+child, so it may read the child's memory under `yama/ptrace_scope=1` -- and
+performs exactly the two reads the eBPF side performs. It skips when there is
+no local `erl`.
+
+The eBPF half needs a privileged agent run:
+
+```sh
+# 1. rebuild the tracer objects (needs clang-17 / llvm-17)
+make -C support/ebpf
+go build .
+
+# 2. a VM with a busy process pinned to scheduler 1
+erl -noshell +S 4:4 +SDcpu 2:2 \
+    -eval 'spawn_opt(fun Loop() -> Loop() end, [{scheduler,1}]), timer:sleep(600000)' &
+
+# 3. profile it
+sudo ./ebpf-profiler -tracers beam -pprof-dir /tmp/prof \
+     -pprof-flush-interval 5s -samples-per-second 997
+```
+
+Then, over the resulting profile: at least 90% of the samples whose `tid`
+label is the `1_scheduler` thread must carry an `erlang_pid_key`, all equal to
+the spinner's term; and samples on non-scheduler tids (`1_aux`, `0_poller`,
+`beam.smp`) must carry none. The remaining <10% is real: it is the scheduler
+in its own dispatch or bookkeeping code with `current_process` null.
 
 ## 4. Sampling semantics: what it does today, where to change it
 
@@ -320,7 +881,7 @@ These are the levers, in increasing order of work:
    not designed for off-CPU-class volumes -- fine for targeted probes and
    markers, not for tracing every sched switch on a busy host.
 
-## 5. The BEAM interpreter (`interpreter/beam/beam.go`, 686 lines)
+## 5. The BEAM interpreter (`interpreter/beam/beam.go`, 707 lines)
 
 The reason this fork exists: Erlang/Elixir stack unwinding for the BEAM VM.
 eBPF side in `support/ebpf/beam_tracer.ebpf.c`.
@@ -351,6 +912,10 @@ eBPF side in `support/ebpf/beam_tracer.ebpf.c`.
   eBPF unwinder, and GCs prefixes from unloaded generations.
 - **Caches**: LRU atom cache, MFA-name cache, and Erlang-string cache
   (`:315-331`), all `LruFunctionCacheSize`.
+- **Per-sample Erlang process attribution** lives in a sibling file,
+  `interpreter/beam/beam_sched.go`, and is independent of unwinding: it can be
+  disabled for a VM (stripped symbols, unknown OTP, failed tripwire) with no
+  effect on stacks. See section 3.9.
 
 ## 6. Sharp edges
 
@@ -373,9 +938,50 @@ BEAM:
   loop condition (`< maxLength`).
 - Symbolization depends on the static symtab: any move to stripped BEAM
   images breaks the interpreter until the etp symbols are exported
-  properly (the TODO at `:161-163`).
+  properly (the TODO at `:161-163`). The same applies, separately, to
+  `erlang_pid_key` (section 3.9), which loses its four scheduler symbols
+  there and disables itself.
+- The `erlang_pid_key` stride probe costs up to 4096 8-byte
+  `process_vm_readv` calls **per array** per BEAM process at attach -- the
+  full candidate range, because acceptance requires uniqueness (section 3.9)
+  and so cannot stop at the first match. Paid once per process, but a host
+  churning through short-lived VMs pays it repeatedly, **and it runs inside
+  `ProcessManager.mu`'s write lock** (`processinfo.go` calls
+  `handleNewInterpreter`, and thus `Data.Attach`, between `pm.mu.Lock()` and
+  `pm.mu.Unlock()`), so those remote reads serialize process discovery for
+  their duration.
+- **The committed `support/ebpf/tracer.ebpf.{amd64,arm64}` are stale** with
+  respect to the `Trace.erlang_pid_key` field: they must be rebuilt with
+  clang-17 before the agent will receive any traces at all. See the warning
+  at the top of section 7 for the exact failure.
 
 ## 7. Working on the fork
+
+> **The committed eBPF objects were relinked with clang-16, not the
+> Makefile's default clang-17.** `support/ebpf/tracer.ebpf.{amd64,arm64}`
+> include the `Trace.erlang_pid_key` field (section 3.9); they were built with
+>
+> ```
+> make -C support/ebpf BPF_CLANG=clang-16 BPF_LINK=llvm-link-16 \
+>      STRIP=llvm-strip-16 LLC=llc-16 [TARGET_ARCH=arm64]
+> ```
+>
+> because no clang-17 was available. clang-16 is what this project built with
+> before upstream PR #270 bumped the pin, and that bump names no feature
+> requirement; measured here, the clang-16 object is +0.07% instructions
+> against the clang-17 one (33,066 vs 33,042) with the new field included, so
+> codegen is equivalent and nowhere near a verifier limit. Two things this
+> does NOT establish: byte-reproducibility against a clang-17 build (relink
+> with 17 if you want the canonical artifact), and BPF verifier acceptance,
+> which needs one privileged run.
+>
+> If the objects ever fall behind the Go-side `support.Trace` again, the
+> failure is loud rather than silent: `loadBpfTrace` rejects the first sample
+> and `tracer/events.go` tears the receive loop down with
+>
+> ```
+> Stop receiving traces: <got> < <want>: trace record too small
+> ```
 
 - Build/test as upstream: `make` targets, Go >= the version in `go.mod`,
   plus the eBPF toolchain for `support/ebpf` changes. The BEAM unwinder has
@@ -413,6 +1019,11 @@ roughly 1/16 of a 16-core host, arriving downstream as *unlabelled* rather than 
 `pid`, `tid` and `ppid` shared the hazard and were spared only because none is ever 0 for
 a sampled thread. All four now carry `unit "id"`, so the exemption is not load-bearing.
 Pinned by `TestPprofFileReporterKeepsZeroValuedIdentifierLabels`.
+
+`erlang_pid_key` (section 3.9) carries `unit "id"` for the same reason, but
+also sidesteps the hazard from the other end: a zero Eterm means
+"unattributable", so the label is omitted rather than emitted as 0. An absent
+`erlang_pid_key` therefore always means "no attribution", never "pid 0".
 
 **Captures taken before this fix are missing their CPU-0 samples' `cpu` label** and must
 not be grouped or filtered on `cpu`; every other label is unaffected.

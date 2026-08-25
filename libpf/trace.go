@@ -197,6 +197,7 @@ func putUint64(b []byte, v uint64) int {
 
 // EbpfTrace holds data sourced from eBPF.
 type EbpfTrace struct {
+ ErlangPidKey uint64
 	CustomLabels     map[String]String
 	Comm             Comm
 	FrameData        []uint64
