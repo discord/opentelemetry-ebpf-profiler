@@ -71,13 +71,14 @@ type drainer struct {
 	rep   *reporterSink
 	jsonl *jsonlSink
 
-	// latestConfig is the most recently observed SCOPE_CONFIG, selected by
-	// MAX ktime_ns across ALL rings (ABI.md's rule), not by dispatch/arrival
-	// order: a later-ktime config drained from one ring is never displaced by
-	// an earlier-ktime one processed after it from another ring. Only
-	// touched from the drain goroutine, like the meta cache.
+	// latestConfig is the most recently observed LIVE SCOPE_CONFIG (bit0 set;
+	// see updateLatestConfig), selected by MAX ktime_ns across ALL rings
+	// (ABI.md's rule), not by dispatch/arrival order: a later-ktime config
+	// drained from one ring is never displaced by an earlier-ktime one
+	// processed after it from another ring. Only touched from the drain
+	// goroutine, like the meta cache.
 	//
-	// prevConfig is the second-newest config seen, by the same ktime_ns
+	// prevConfig is the second-newest LIVE config seen, by the same ktime_ns
 	// ordering. The max-ktime rule governs which config is HELD; it never
 	// governs which config a given record is scaled BY. Because DrainInto
 	// walks rings 0..n-1 while the writer's records are only ordered within
@@ -320,10 +321,11 @@ func (d *drainer) reportBound(h heldRecord) {
 }
 
 // resolveRecvShift picks the receive-sample shift for a record stamped at
-// ktime, from the newest RETAINED SCOPE_CONFIG that is NOT NEWER than the
-// record (KTimeNS <= ktime). A newer config was not yet in force when the
-// record was written, so scaling by it would produce a wrong number rather
-// than a missing one.
+// ktime, from the newest RETAINED LIVE SCOPE_CONFIG that is NOT NEWER than
+// the record (KTimeNS <= ktime). Only live configs are ever retained (see
+// updateLatestConfig), so a torn-down one can never scale anything. A newer
+// config was not yet in force when the record was written, so scaling by it
+// would produce a wrong number rather than a missing one.
 //
 // Once such a config is found it is authoritative: if it predates
 // RecvSampleShift (PayloadLen < 48) or says receive tracing is disabled
@@ -483,10 +485,24 @@ func (d *drainer) dispatch(rec Record) {
 // dispatched relative to the current holder. The displaced holder is demoted
 // to prevConfig rather than dropped, and a config that is not the newest but
 // is newer than the retained previous one takes that slot -- so the two
-// newest configs seen (by ktime_ns) are always the two retained, whatever
-// order they were dispatched in. resolveRecvShift needs that history to
-// scale a record by a config that was actually in force when it was written.
+// newest LIVE configs seen (by ktime_ns) are always the two retained,
+// whatever order they were dispatched in. resolveRecvShift needs that
+// history to scale a record by a config that was actually in force when it
+// was written.
+//
+// Only a config with bit0 (Active) SET is eligible. The ABI says a reader
+// keeps the last bit0-set record as the live config, and the downstream
+// consumer implements exactly that; latching purely by ktime would let a
+// torn-down config (flags 0, which really does occur in recorded segments)
+// become the holder and supply a shift the writer had already retired --
+// scaling the same quantity differently on the two sides of the same
+// capture. Rejected configs are not lost: every SCOPE_CONFIG record, live or
+// not, still reaches the JSONL sidecar (see dispatch), which is where the
+// full config history is reported.
 func (d *drainer) updateLatestConfig(sc *ScopeConfig) {
+	if !sc.Active {
+		return
+	}
 	switch {
 	case d.latestConfig == nil || sc.KTimeNS > d.latestConfig.KTimeNS:
 		d.prevConfig = d.latestConfig

@@ -624,9 +624,22 @@ func (s *socketSink) run() {
 // closes. A consumer therefore sees the authoritative totals for the run
 // immediately before EOF.
 func (s *socketSink) drainAndClose() {
+	// The sink dials lazily, on the first sample to reach run(). When stop and
+	// a queued sample are both ready, run()'s select picks between them at
+	// random, so shutdown can arrive here with samples in the ring and no
+	// connection ever attempted. Dropping those meant a short run -- or any run
+	// whose first samples coincided with shutdown -- silently delivered
+	// nothing. One dial attempt, not the backoff loop: if the consumer is not
+	// there, the drops below are the honest answer, and shutdown must stay
+	// bounded.
+	dialed := false
 	for {
 		select {
 		case ev := <-s.ring:
+			if s.conn == nil && !dialed {
+				dialed = true
+				_ = s.dial()
+			}
 			if s.conn == nil {
 				s.st.droppedNoSock.Add(1)
 				continue

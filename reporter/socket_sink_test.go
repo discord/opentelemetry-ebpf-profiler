@@ -880,3 +880,41 @@ func TestSocketSinkFlushesEachSampleWithoutWaitingForATicker(t *testing.T) {
 	assert.Greater(t, afterSecond, afterFirst)
 	assert.Zero(t, s.Dropped())
 }
+
+// Shutdown can reach the drain with samples queued and nothing dialed yet:
+// run() dials on the first sample it processes, and its select picks between a
+// ready stop and a ready ring at random. Before the drain dialed, that path
+// charged every queued sample to droppedNoSock and closed without connecting,
+// so a run whose first samples coincided with shutdown delivered nothing.
+func TestSocketSinkDrainDialsForQueuedSamples(t *testing.T) {
+	l := newListener(t)
+	s, err := newSocketSink(SocketConfig{Path: l.path, FlushInterval: time.Hour})
+	require.NoError(t, err)
+	require.Nil(t, s.conn, "the sink must reach the drain unconnected")
+	s.offer(oneSample())
+	s.offer(oneSample())
+
+	s.drainAndClose()
+
+	st := readStream(t, bytes.NewReader(l.readAll(t)))
+	require.Len(t, st.samples, 2)
+	assert.Equal(t, []string{"leaf"}, st.samples[0].funcs)
+	assert.Zero(t, s.Dropped(), "queued samples must not be charged as dropped")
+}
+
+// The same path with no consumer must stay bounded and honest: one dial
+// attempt, no backoff loop, and the samples counted as dropped.
+func TestSocketSinkDrainDialFailureStaysBounded(t *testing.T) {
+	s, err := newSocketSink(SocketConfig{
+		Path: filepath.Join(t.TempDir(), "absent.sock"), FlushInterval: time.Hour,
+	})
+	require.NoError(t, err)
+	s.offer(oneSample())
+	s.offer(oneSample())
+
+	start := time.Now()
+	s.drainAndClose()
+	assert.Less(t, time.Since(start), 5*time.Second, "drain must not retry-loop")
+	assert.Equal(t, uint64(2), s.Dropped())
+	assert.Nil(t, s.conn)
+}

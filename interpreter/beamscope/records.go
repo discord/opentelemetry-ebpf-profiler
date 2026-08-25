@@ -52,15 +52,40 @@ const (
 	// $initial_call) -- it names what the process was doing, not how it
 	// started.
 	procMetaFlagCurrentFunction = 1 << 2
+	// gcDelta2FlagNoStart: the matching gc_start was never observed (the
+	// writer attached mid-GC, or the start record was dropped), so the writer
+	// ZERO-FILLED pause_ns and mbuf_words and gc_kind is meaningless. Only
+	// alloc_words/bin_vheap_delta_words/heap_size_words are measured.
+	gcDelta2FlagNoStart = 1 << 0
 	// schedUtilFlagMsaccValid: the msacc microstate fields carry data (zero
 	// otherwise, when msacc is not enabled in the writer's config).
 	schedUtilFlagMsaccValid = 1 << 0
+	// schedUtilFlagMsaccOnly: this row is an aux (sched_type 3) or poll
+	// (sched_type 4) thread, which has no scheduler_wall_time entry -- the
+	// writer zero-fills active_ns/total_ns, and scheduler_id is the PER-TYPE
+	// msacc id, so it collides with a real scheduler's id. A consumer
+	// computing active/total per scheduler must exclude these rows rather
+	// than read the zeroes as "idle since the previous tick".
+	schedUtilFlagMsaccOnly = 1 << 1
 	// schedDeltaFlagUnclassified: preempt/yield classification unsupported by
 	// this writer; those counters are zero, nswitches is still valid.
 	schedDeltaFlagUnclassified = 1 << 0
 	// scopeConfigFlagActive: tracing is active in the writer (the config
-	// reflects a live BeamScope.start/1, not a stopped/idle segment).
+	// reflects a live BeamScope.start/1, not a stopped/idle segment). A
+	// reader keeps the last bit0-SET record as the LIVE config; a torn-down
+	// config (flags 0) must never supply a scaling shift, even when it is the
+	// newest record by ktime_ns.
 	scopeConfigFlagActive = 1 << 0
+	// scopeConfigFlagMonitorsActive: the writer's system_monitor hooks are
+	// installed, i.e. MONITOR_EVENT (0x06) records can be expected.
+	scopeConfigFlagMonitorsActive = 1 << 1
+	// scopeConfigFlagProcsActive: the writer's per-process tracing (the panel
+	// / PROC_META / PROC_EXIT population) is active.
+	scopeConfigFlagProcsActive = 1 << 2
+	// scopeConfigFlagRecvActive: the writer's receive-side tracing is active,
+	// i.e. MSG_FLOW (0x0D) records can be expected. Distinct from
+	// RecvSampleShift, which says at what rate they are sampled when it is.
+	scopeConfigFlagRecvActive = 1 << 3
 	// vmStatFlagMemoryValid: the mem_* fields carry data (zero otherwise, when
 	// the writer's memory sampling is disabled).
 	vmStatFlagMemoryValid = 1 << 0
@@ -217,30 +242,52 @@ type GCDelta2 struct {
 	PidKey             uint64 `json:"pid_key"`
 	AllocWords         uint64 `json:"alloc_words"`
 	BinVheapDeltaWords uint64 `json:"bin_vheap_delta_words"`
-	MbufWords          uint64 `json:"mbuf_words"`
-	HeapSizeWords      uint64 `json:"heap_size_words"` // live heap after this GC
-	PauseNS            uint64 `json:"pause_ns"`
-	GCKind             uint8  `json:"gc_kind"` // 0 minor, 1 major
+	// MbufWords and PauseNS are zero-filled by the writer when NoStart, and
+	// GCKind is then meaningless -- a 0 there is NOT "minor".
+	MbufWords     uint64 `json:"mbuf_words"`
+	HeapSizeWords uint64 `json:"heap_size_words"` // live heap after this GC
+	PauseNS       uint64 `json:"pause_ns"`
+	GCKind        uint8  `json:"gc_kind"` // 0 minor, 1 major (only when !NoStart)
+	// NoStart (flags bit0): the matching gc_start was never observed, so
+	// pause_ns/mbuf_words/gc_kind carry no measurement. A consumer must not
+	// average a NoStart record's pause_ns into GC-pause statistics: it is a
+	// zero-fill, not a genuinely fast GC.
+	NoStart bool `json:"no_start"`
 }
 
 func (*GCDelta2) TypeName() string { return "gc_delta2" }
 
 // SchedUtil (0x09): one per scheduler per Panel tick. Microstate fields are
-// zero unless MsaccValid.
+// zero unless MsaccValid. Aux and poll threads arrive as MsaccOnly rows,
+// which carry microstate but no scheduler_wall_time.
 type SchedUtil struct {
 	RecordHeader
+	// SchedulerID is the scheduler's id within its SchedType. For an
+	// MsaccOnly row it is the PER-TYPE msacc id, which collides with a real
+	// scheduler's id -- key by (SchedType, SchedulerID), never by
+	// SchedulerID alone.
 	SchedulerID uint32 `json:"scheduler_id"`
-	SchedType   uint8  `json:"sched_type"` // 0 normal, 1 dirty_cpu, 2 dirty_io
-	Epoch       uint32 `json:"epoch"`
-	ActiveNS    uint64 `json:"active_ns"`
-	TotalNS     uint64 `json:"total_ns"`
-	EmulatorNS  uint64 `json:"emulator_ns"`
-	GCNS        uint64 `json:"gc_ns"`
-	PortNS      uint64 `json:"port_ns"`
-	SleepNS     uint64 `json:"sleep_ns"`
-	OtherNS     uint64 `json:"other_ns"`
+	// SchedType: 0 normal, 1 dirty_cpu, 2 dirty_io, 3 aux, 4 poll. Types 3
+	// and 4 always arrive with MsaccOnly set.
+	SchedType uint8  `json:"sched_type"`
+	Epoch     uint32 `json:"epoch"`
+	// ActiveNS and TotalNS are zero-filled when MsaccOnly: the thread has no
+	// scheduler_wall_time entry, so the zeroes mean "not applicable", not
+	// "idle since the previous tick".
+	ActiveNS   uint64 `json:"active_ns"`
+	TotalNS    uint64 `json:"total_ns"`
+	EmulatorNS uint64 `json:"emulator_ns"`
+	GCNS       uint64 `json:"gc_ns"`
+	PortNS     uint64 `json:"port_ns"`
+	SleepNS    uint64 `json:"sleep_ns"`
+	OtherNS    uint64 `json:"other_ns"`
 	// MsaccValid (flags bit0): the msacc microstate fields carry data.
 	MsaccValid bool `json:"msacc_valid"`
+	// MsaccOnly (flags bit1): an aux or poll thread; active_ns/total_ns are
+	// zero-fills and scheduler_id is per-type. A consumer computing
+	// active/total per scheduler must exclude these rows or it will divide by
+	// zero and double-count another scheduler's id.
+	MsaccOnly bool `json:"msacc_only"`
 }
 
 func (*SchedUtil) TypeName() string { return "sched_util" }
@@ -309,8 +356,16 @@ type ScopeConfig struct {
 	// EtsEvery: 0 means off/unknown; also the zero value when absent at
 	// PayloadLen < 72.
 	EtsEvery uint32 `json:"ets_every"`
-	// Active (flags bit0): tracing is active in the writer.
+	// Active (flags bit0): tracing is active in the writer. Only a record
+	// with this set is the LIVE config; a torn-down one (all flags clear) is
+	// a historical record and never supplies a scaling shift.
 	Active bool `json:"active"`
+	// MonitorsActive (flags bit1): the writer's system_monitor hooks are on.
+	MonitorsActive bool `json:"monitors_active"`
+	// ProcsActive (flags bit2): the writer's per-process tracing is on.
+	ProcsActive bool `json:"procs_active"`
+	// RecvActive (flags bit3): the writer's receive-side tracing is on.
+	RecvActive bool `json:"recv_active"`
 	// PayloadLen is the number of payload bytes actually present in this
 	// record (36, 40, 48, 60, 64, or 72 for known writers so far; may be
 	// larger for a future writer whose extra fields this reader does not
@@ -564,6 +619,7 @@ func decodeRecord(rec []byte) (Record, error) {
 			HeapSizeWords:      c.u64(),
 			PauseNS:            c.u64(),
 			GCKind:             c.u8(),
+			NoStart:            hdr.Flags&gcDelta2FlagNoStart != 0,
 		}
 	case recTypeSchedUtil:
 		out = &SchedUtil{
@@ -579,6 +635,7 @@ func decodeRecord(rec []byte) (Record, error) {
 			SleepNS:      c.u64(),
 			OtherNS:      c.u64(),
 			MsaccValid:   hdr.Flags&schedUtilFlagMsaccValid != 0,
+			MsaccOnly:    hdr.Flags&schedUtilFlagMsaccOnly != 0,
 		}
 	case recTypeSchedDelta:
 		out = &SchedDelta{
@@ -608,6 +665,9 @@ func decodeRecord(rec []byte) (Record, error) {
 			TopkK:            c.u32(),
 			MemoryEvery:      c.u32(),
 			Active:           hdr.Flags&scopeConfigFlagActive != 0,
+			MonitorsActive:   hdr.Flags&scopeConfigFlagMonitorsActive != 0,
+			ProcsActive:      hdr.Flags&scopeConfigFlagProcsActive != 0,
+			RecvActive:       hdr.Flags&scopeConfigFlagRecvActive != 0,
 		}
 		if payloadLen >= 40 {
 			sc.TickMS = c.u32()

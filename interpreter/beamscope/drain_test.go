@@ -187,7 +187,10 @@ func TestLatestScopeConfigSelectedByMaxKtimeAcrossRings(t *testing.T) {
 	}
 
 	// Ring 0: an earlier-ktime config, written and drained in a later poll.
-	f.mustWrite(t, 0, encScopeConfig(48, 0, 100, tU,
+	// Live (bit0 set) like the others: this test isolates the KTIME rule, and
+	// a torn-down config would be rejected for an unrelated reason (see
+	// TestTornDownScopeConfigNeverScales).
+	f.mustWrite(t, 0, encScopeConfig(48, scopeConfigFlagActive, 100, tU,
 		2, 999, 999, 9, 9, 9, 9, 9, 9, 9, 0, 0, 0, 0, 0, 0))
 	d.drainOnce()
 	if d.latestConfig.KTimeNS != 300 {
@@ -201,7 +204,7 @@ func TestLatestScopeConfigSelectedByMaxKtimeAcrossRings(t *testing.T) {
 	}
 
 	// A genuinely later ktime, arriving later, DOES replace it.
-	f.mustWrite(t, 0, encScopeConfig(48, 0, 400, tU,
+	f.mustWrite(t, 0, encScopeConfig(48, scopeConfigFlagActive, 400, tU,
 		3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0))
 	d.drainOnce()
 	if d.latestConfig.KTimeNS != 400 {

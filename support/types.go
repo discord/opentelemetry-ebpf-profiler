@@ -96,9 +96,7 @@ const (
 	TraceOriginSampling = 0x1
 	TraceOriginOffCPU   = 0x2
 	TraceOriginProbe    = 0x3
-	// Discord: user-space beamscope samples (interpreter/beamscope); sourced
-	// from TRACE_BEAMSCOPE in support/ebpf/types.h via types_def.go, so a
-	// regen of this file reproduces it (without this comment).
+
 	TraceOriginBeamScope = 0x4
 )
 

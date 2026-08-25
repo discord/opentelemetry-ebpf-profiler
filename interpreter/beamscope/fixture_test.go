@@ -266,6 +266,17 @@ func encPanelTickDropped(ktime, unix uint64, epoch, panelSize, watchSize uint32,
 
 func encGCDelta2(ktime, unix, pidKey, alloc, binVheap, mbuf, heap, pause uint64,
 	kind uint8) []byte {
+	return encGCDelta2F(0, ktime, unix, pidKey, alloc, binVheap, mbuf, heap,
+		pause, kind)
+}
+
+// encGCDelta2F is encGCDelta2 with header flags (bit0 = NO_START: the writer
+// never saw the matching gc_start, so it zero-fills pause_ns and mbuf_words
+// and gc_kind carries no meaning). The caller still passes values for those
+// fields so a test can prove the reader suppresses them rather than merely
+// echoing zeroes the encoder happened to write.
+func encGCDelta2F(flags uint32, ktime, unix, pidKey, alloc, binVheap, mbuf,
+	heap, pause uint64, kind uint8) []byte {
 	var p payloadWriter
 	p.u64(pidKey)
 	p.u64(alloc)
@@ -274,7 +285,7 @@ func encGCDelta2(ktime, unix, pidKey, alloc, binVheap, mbuf, heap, pause uint64,
 	p.u64(heap)
 	p.u64(pause)
 	p.u8(kind)
-	return encRecord(recTypeGCDelta2, 0, ktime, unix, p.b)
+	return encRecord(recTypeGCDelta2, flags, ktime, unix, p.b)
 }
 
 // encSchedUtil takes header flags first (bit0 = msacc fields valid).
@@ -460,13 +471,17 @@ func collect(seg *Segment) (recs []Record, st DrainStats) {
 	return recs, st
 }
 
-// recordedFixtureDir is where the writer peer hands over segments recorded
-// from a real BEAM by the beam_scope shmdump tool.
-const recordedFixtureDir = "/home/discord/dev/worktrees/main/.worktrees/" +
-	"sanchda/evil_beam_shit/discord_common/ex/beam_scope/test/fixtures"
+// recordedFixtureDir holds segments recorded from a real BEAM by the
+// beam_scope shmdump tool, copied in from the writer peer's monorepo tree so
+// that this coverage travels with the repo. It used to be an absolute path
+// into one developer's worktree, which meant every recorded-fixture test
+// silently skipped on every other machine -- the exact opposite of what a
+// producer-bytes test is for. Point BEAMSCOPE_FIXTURE* at a newer capture to
+// override an individual file.
+const recordedFixtureDir = "testdata"
 
 // recordedFixturePath resolves a recorded segment path: the env var when set,
-// otherwise the monorepo handoff location.
+// otherwise the checked-in copy.
 func recordedFixturePath(env, name string) string {
 	if p := os.Getenv(env); p != "" {
 		return p
@@ -475,12 +490,14 @@ func recordedFixturePath(env, name string) string {
 }
 
 // loadRecordedSegment validates a recorded segment through the real entry
-// point, skipping the test when the writer peer has not handed it over yet.
+// point. The fixtures are checked in, so a skip here means someone deleted
+// or overrode one -- it is a loud condition, not the normal state.
 func loadRecordedSegment(t *testing.T, env, name string) *Segment {
 	t.Helper()
 	raw, err := os.ReadFile(recordedFixturePath(env, name))
 	if err != nil {
-		t.Skipf("recorded fixture not available: %v", err)
+		t.Skipf("recorded fixture %s not readable (checked in under %s/; set "+
+			"%s to override): %v", name, recordedFixtureDir, env, err)
 	}
 	seg, err := NewSegment(raw)
 	if err != nil {

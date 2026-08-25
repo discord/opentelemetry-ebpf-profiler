@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/times"
+	tracertypes "go.opentelemetry.io/ebpf-profiler/tracer/types"
 	"go.opentelemetry.io/ebpf-profiler/vc"
 	"go.opentelemetry.io/otel/metric/noop"
 
@@ -129,6 +130,24 @@ func mainWithExitCode() exitCode {
 		return failure("-beamscope requires the pprof-file egress (-pprof-dir); " +
 			"the OTLP path freezes per-sample beamscope labels, and the v1 socket " +
 			"wire cannot carry value/valueKind, erlang_pid_key or custom labels")
+	}
+
+	// Discord: per-sample Erlang attribution (erlang_pid_key, section 3.9 of
+	// doc/discord-fork.md) is switched on by "-tracers beam" ALONE -- it does
+	// not need -beamscope -- but the label only reaches the pprof-file
+	// backend. The v1 socket wire has no field for it and the OTLP reporter
+	// never emits it, so "-tracers beam -socket-egress" without -pprof-dir
+	// pays the whole attach-time stride probe and then drops every label it
+	// bought. Warn rather than fail: the BEAM tracer is genuinely useful
+	// without the attribution, but the loss must not be silent.
+	if !pprofEgressEnabled() {
+		if it, perr := tracertypes.Parse(cfg.Tracers); perr == nil &&
+			it.Has(tracertypes.BEAMTracer) {
+			log.Warn("the beam tracer is enabled without -pprof-dir: for any " +
+				"BEAM process profiled here, per-sample Erlang attribution (the " +
+				"erlang_pid_key pprof label) is computed and then DROPPED -- " +
+				"neither the v1 socket wire nor the OTLP reporter can carry it")
+		}
 	}
 
 	// Discord: with -pprof-dir and/or -socket-egress, egress is local; see

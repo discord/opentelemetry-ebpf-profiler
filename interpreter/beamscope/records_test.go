@@ -719,3 +719,152 @@ func TestDecodeEmptyStrings(t *testing.T) {
 		t.Fatalf("expected zero spawn ktime, got %d", pm.SpawnKtimeNS)
 	}
 }
+
+// TestDecodeGCDelta2NoStart pins the NO_START flag (0x08 bit0). The writer
+// sets it when the matching gc_start was never observed and then ZERO-FILLS
+// pause_ns and mbuf_words; gc_kind is meaningless. Without the decode a
+// NO_START record is indistinguishable from a genuine 0 ns pause on a
+// zero-mbuf GC, and gets averaged into GC-pause statistics as if measured.
+// The encoder writes NONZERO values into those fields on purpose here: a
+// reader that merely echoed the bytes would pass a zero-valued fixture.
+func TestDecodeGCDelta2NoStart(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		flags       uint32
+		wantNoStart bool
+	}{
+		{name: "measured", flags: 0, wantNoStart: false},
+		{name: "no_start", flags: gcDelta2FlagNoStart, wantNoStart: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := encGCDelta2F(tc.flags, tK, tU, 0x77, 4096, 8, 16, 2048,
+				123_456, 1)
+			rec, err := decodeRecord(raw)
+			if err != nil {
+				t.Fatalf("decodeRecord: %v", err)
+			}
+			g := rec.(*GCDelta2)
+			if g.NoStart != tc.wantNoStart {
+				t.Fatalf("NoStart = %v, want %v", g.NoStart, tc.wantNoStart)
+			}
+			// The measured fields decode identically either way; it is the
+			// FLAG that tells a consumer whether to trust them. Asserting the
+			// raw values still decode keeps the flag from being read as
+			// "these bytes are absent".
+			if g.AllocWords != 4096 || g.HeapSizeWords != 2048 {
+				t.Fatalf("measured fields wrong: %+v", g)
+			}
+			if g.PauseNS != 123_456 || g.MbufWords != 16 {
+				t.Fatalf("payload fields not decoded verbatim: %+v", g)
+			}
+		})
+	}
+}
+
+// TestDecodeSchedUtilMsaccOnly pins MSACC_ONLY (0x09 bit1). Aux (sched_type
+// 3) and poll (sched_type 4) threads have no scheduler_wall_time entry, so
+// the writer zero-fills active_ns/total_ns and scheduler_id is the PER-TYPE
+// msacc id. Without the decode those rows reach JSONL as
+// "active_ns: 0, total_ns: 0, msacc_valid: true" -- indistinguishable from a
+// scheduler that was idle since the previous tick, and colliding with a real
+// scheduler's id.
+func TestDecodeSchedUtilMsaccOnly(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		flags     uint32
+		schedType uint8
+		active    uint64
+		total     uint64
+		wantOnly  bool
+	}{
+		{name: "normal_scheduler", flags: schedUtilFlagMsaccValid,
+			schedType: 0, active: 700, total: 1000, wantOnly: false},
+		{name: "aux_thread",
+			flags:     schedUtilFlagMsaccValid | schedUtilFlagMsaccOnly,
+			schedType: 3, wantOnly: true},
+		{name: "poll_thread",
+			flags:     schedUtilFlagMsaccValid | schedUtilFlagMsaccOnly,
+			schedType: 4, wantOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := encSchedUtil(tc.flags, tK, tU, 1, tc.schedType, 3,
+				tc.active, tc.total, 10, 20, 30, 40, 50)
+			rec, err := decodeRecord(raw)
+			if err != nil {
+				t.Fatalf("decodeRecord: %v", err)
+			}
+			su := rec.(*SchedUtil)
+			if su.MsaccOnly != tc.wantOnly {
+				t.Fatalf("MsaccOnly = %v, want %v", su.MsaccOnly, tc.wantOnly)
+			}
+			if !su.MsaccValid {
+				t.Fatalf("MsaccValid = false, want true: %+v", su)
+			}
+			if su.SchedType != tc.schedType {
+				t.Fatalf("SchedType = %d, want %d", su.SchedType, tc.schedType)
+			}
+			// The microstate fields are the ones an MsaccOnly row actually
+			// carries, so they must survive regardless.
+			if su.EmulatorNS != 10 || su.SleepNS != 40 {
+				t.Fatalf("microstate fields wrong: %+v", su)
+			}
+		})
+	}
+}
+
+// TestDecodeSchedUtilMsaccOnlyWithoutValid covers the flag combination this
+// reader must not conflate: bit1 without bit0. Each bit answers a separate
+// question (is this an aux/poll row? do the microstate fields carry data?)
+// and neither may imply the other.
+func TestDecodeSchedUtilMsaccOnlyWithoutValid(t *testing.T) {
+	raw := encSchedUtil(schedUtilFlagMsaccOnly, tK, tU, 2, 3, 3,
+		0, 0, 0, 0, 0, 0, 0)
+	rec, err := decodeRecord(raw)
+	if err != nil {
+		t.Fatalf("decodeRecord: %v", err)
+	}
+	su := rec.(*SchedUtil)
+	if !su.MsaccOnly || su.MsaccValid {
+		t.Fatalf("MsaccOnly=%v MsaccValid=%v, want true/false: %+v",
+			su.MsaccOnly, su.MsaccValid, su)
+	}
+}
+
+// TestDecodeScopeConfigSubsystemFlags pins SCOPE_CONFIG bits 1/2/3
+// (MONITORS_ACTIVE, PROCS_ACTIVE, RECV_ACTIVE). They used to survive only as
+// the raw record_flags envelope field, forcing every consumer to re-decode
+// the producer's ABI by hand.
+func TestDecodeScopeConfigSubsystemFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name                     string
+		flags                    uint32
+		active, mon, procs, recv bool
+	}{
+		{name: "torn_down", flags: 0},
+		{name: "active_only", flags: scopeConfigFlagActive, active: true},
+		{name: "procs_and_recv",
+			flags: scopeConfigFlagActive | scopeConfigFlagProcsActive |
+				scopeConfigFlagRecvActive,
+			active: true, procs: true, recv: true},
+		{name: "all",
+			flags: scopeConfigFlagActive | scopeConfigFlagMonitorsActive |
+				scopeConfigFlagProcsActive | scopeConfigFlagRecvActive,
+			active: true, mon: true, procs: true, recv: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := encScopeConfig(72, tc.flags, tK, tU, 6, 40_000, 2_000_000,
+				8192, 4096, 16, 5000, 250, 4, 100, 20, 8, 32, 5, 5, 1000)
+			rec, err := decodeRecord(raw)
+			if err != nil {
+				t.Fatalf("decodeRecord: %v", err)
+			}
+			sc := rec.(*ScopeConfig)
+			if sc.Active != tc.active || sc.MonitorsActive != tc.mon ||
+				sc.ProcsActive != tc.procs || sc.RecvActive != tc.recv {
+				t.Fatalf("active=%v mon=%v procs=%v recv=%v, want %v/%v/%v/%v",
+					sc.Active, sc.MonitorsActive, sc.ProcsActive, sc.RecvActive,
+					tc.active, tc.mon, tc.procs, tc.recv)
+			}
+		})
+	}
+}

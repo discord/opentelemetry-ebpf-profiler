@@ -774,7 +774,7 @@ Two things this task did not touch:
 - **The OTLP reporter does not emit it.** Only the local egress's pprof backend
   does.
 
-#### Validating it end to end (needs root and a rebuilt tracer object)
+#### Validating it end to end (needs root)
 
 `TestBeamSchedLiveAttach` (`interpreter/beam/beam_sched_test.go`) covers the
 whole user-space half against a real VM without root -- it starts `erl` as a
@@ -785,8 +785,9 @@ no local `erl`.
 The eBPF half needs a privileged agent run:
 
 ```sh
-# 1. rebuild the tracer objects (needs clang-17 / llvm-17)
-make -C support/ebpf
+# 1. build the agent. The committed tracer objects already contain
+#    erlang_pid_key, so `make -C support/ebpf` is only needed if you changed
+#    the eBPF C (and see the section 7 banner about the clang pin first).
 go build .
 
 # 2. a VM with a busy process pinned to scheduler 1
@@ -950,10 +951,12 @@ BEAM:
   `handleNewInterpreter`, and thus `Data.Attach`, between `pm.mu.Lock()` and
   `pm.mu.Unlock()`), so those remote reads serialize process discovery for
   their duration.
-- **The committed `support/ebpf/tracer.ebpf.{amd64,arm64}` are stale** with
-  respect to the `Trace.erlang_pid_key` field: they must be rebuilt with
-  clang-17 before the agent will receive any traces at all. See the warning
-  at the top of section 7 for the exact failure.
+- **The committed `support/ebpf/tracer.ebpf.{amd64,arm64}` already carry the
+  field.** They were rebuilt and committed, and verified by `readelf`/BTF/
+  disassembly to contain `beam_sched_tids`, `BeamSchedInfo`, and the store of
+  `erlang_pid_key` at offset 720 (`*(u64 *)(r9 + 0x2d0) = r1`). No rebuild is
+  needed to receive traces. See the banner at the top of section 7 for which
+  clang built them and what that does and does not establish.
 
 ## 7. Working on the fork
 
