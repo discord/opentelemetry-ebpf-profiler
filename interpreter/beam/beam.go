@@ -9,6 +9,7 @@ package beam // import "go.opentelemetry.io/ebpf-profiler/interpreter/beam"
 // that share the same bytecode, such as Elixir and Gleam.
 
 import (
+	"encoding/binary"
 	"fmt"
 	"regexp"
 	"strconv"
@@ -114,15 +115,13 @@ type beamMfa struct {
 type beamInstance struct {
 	interpreter.InstanceStubs
 
-	pid                libpf.PID
-	data               *beamData
-	rm                 remotememory.RemoteMemory
-	activeCodeIndexPtr libpf.Address
-	rangesPtr          libpf.Address
-	atomTable          libpf.Address
-	atomCache          *freelru.LRU[uint32, libpf.String]
-	mfaNameCache       *freelru.LRU[beamMfa, libpf.String]
-	stringCache        *freelru.LRU[libpf.Address, libpf.String]
+	pid          libpf.PID
+	data         *beamData
+	rm           remotememory.RemoteMemory
+	atomTable    libpf.Address
+	atomCache    *freelru.LRU[uint32, libpf.String]
+	mfaNameCache *freelru.LRU[beamMfa, libpf.String]
+	stringCache  *freelru.LRU[libpf.Address, libpf.String]
 
 	// prefixes is indexed by the prefix added to ebpf maps (to be cleaned up) to its generation
 	prefixes map[lpm.Prefix]uint32
@@ -299,10 +298,21 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 	rm remotememory.RemoteMemory) (interpreter.Instance, error) {
 	log.Debugf("BEAM attaching, OTP %d, ERTS %s, bias: 0x%x", d.otpRelease, d.ertsVersion, bias)
 
+	// beam_normal_exit is a pointer variable in the executable. The unwinder
+	// compares PCs with its value, which points into the JIT code cache.
+	var normalExitBytes [8]byte
+	if err := rm.Read(bias+d.beamNormalExit, normalExitBytes[:]); err != nil {
+		return nil, fmt.Errorf("failed to read BEAM normal exit: %w", err)
+	}
+	normalExit := binary.LittleEndian.Uint64(normalExitBytes[:])
+	if normalExit == 0 {
+		return nil, fmt.Errorf("BEAM normal exit is null")
+	}
+
 	data := support.BEAMProcInfo{
 		R:                     uint64(bias + d.r),
 		The_active_code_index: uint64(bias + d.theActiveCodeIndex),
-		Beam_normal_exit:      uint64(bias + d.beamNormalExit),
+		Beam_normal_exit:      normalExit,
 		Ranges_sizeof:         uint8(d.vmStructs.ranges.sizeOf),
 	}
 
@@ -336,16 +346,14 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 	}
 
 	return &beamInstance{
-		pid:                pid,
-		data:               d,
-		rm:                 rm,
-		activeCodeIndexPtr: bias + libpf.Address(d.theActiveCodeIndex),
-		prefixes:           make(map[lpm.Prefix]uint32),
-		rangesPtr:          bias + libpf.Address(d.r),
-		atomTable:          bias + libpf.Address(d.ertsAtomTable),
-		atomCache:          atomCache,
-		mfaNameCache:       mfaNameCache,
-		stringCache:        stringCache,
+		pid:          pid,
+		data:         d,
+		rm:           rm,
+		prefixes:     make(map[lpm.Prefix]uint32),
+		atomTable:    bias + libpf.Address(d.ertsAtomTable),
+		atomCache:    atomCache,
+		mfaNameCache: mfaNameCache,
+		stringCache:  stringCache,
 	}, nil
 }
 
@@ -356,48 +364,31 @@ func (i *beamInstance) UsesAnonymousMappings() bool {
 	return true
 }
 
-func (i *beamInstance) readActiveRanges() (modules libpf.Address, n uint64, err error) {
-	activeCodeIndex := i.rm.Uint32(i.activeCodeIndexPtr)
-	activeRanges := i.rangesPtr + libpf.Address(uint64(i.data.vmStructs.ranges.sizeOf)*uint64(activeCodeIndex))
-
-	var rangesInfo [16]byte
-	if err := i.rm.Read(activeRanges, rangesInfo[:]); err != nil {
-		return 0, 0, fmt.Errorf("BEAM failed to read active ranges: %w", err)
-	}
-
-	modules = npsr.Ptr(rangesInfo[:], 0)
-	n = npsr.Uint64(rangesInfo[:], 8)
-	if modules == 0 || n == 0 {
-		return 0, 0, fmt.Errorf("BEAM active ranges are empty")
-	}
-
-	return modules, n, nil
-}
-
 func (i *beamInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler, _ reporter.ExecutableReporter, pr process.Process, mappings []process.RawMapping) error {
+	// Validate the complete mapping set before changing any eBPF entries.
+	for idx := range mappings {
+		m := &mappings[idx]
+		if !m.IsExecutable() || !m.IsAnonymous() {
+			continue
+		}
+		if m.Length == 0 || m.Vaddr > ^uint64(0)-m.Length {
+			return fmt.Errorf("invalid BEAM executable mapping %#x/%#x", m.Vaddr, m.Length)
+		}
+	}
+
 	pid := pr.PID()
 	i.mappingGeneration++
-	modules, n, err := i.readActiveRanges()
-	if err != nil {
-		return err
-	}
-
-	var rangeEntry [16]byte
-	for idx := uint64(0); idx < n; idx++ {
-		if err := i.rm.Read(modules+libpf.Address(idx*16), rangeEntry[:]); err != nil {
-			return fmt.Errorf("BEAM failed to read module range %d: %w", idx, err)
-		}
-		start := npsr.Ptr(rangeEntry[:], 0)
-		end := npsr.Ptr(rangeEntry[:], 8)
-		if start == 0 || end <= start {
+	for idx := range mappings {
+		m := &mappings[idx]
+		if !m.IsExecutable() || !m.IsAnonymous() {
 			continue
 		}
 
-		log.Debugf("Enabling BEAM for %#x/%#x", start, end-start)
+		log.Debugf("Enabling BEAM for %#x/%#x", m.Vaddr, m.Length)
 
-		prefixes, err := lpm.CalculatePrefixList(uint64(start), uint64(end))
+		prefixes, err := lpm.CalculatePrefixList(m.Vaddr, m.Vaddr+m.Length)
 		if err != nil {
-			return fmt.Errorf("new BEAM mapping lpm failure %#x/%#x", start, end-start)
+			return fmt.Errorf("new BEAM mapping lpm failure %#x/%#x: %w", m.Vaddr, m.Length, err)
 		}
 
 		for _, prefix := range prefixes {
