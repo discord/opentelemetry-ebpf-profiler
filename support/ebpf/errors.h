@@ -238,58 +238,58 @@ typedef enum ErrorCode {
   ERR_BEAM_RANGE_SEARCH_EXHAUSTED = 7006,
 
   // BEAM: Could not safely unwind a frame-pointer transition
-  ERR_BEAM_FP_TRANSITION_INVALID = 7007,
+  ERR_BEAM_FP_TRANSITION_INVALID = 7907,
 
   // BEAM: PC falls in a gap between module code ranges
-  ERR_BEAM_MODULE_RANGE_GAP = 7008,
+  ERR_BEAM_MODULE_RANGE_GAP = 7908,
 
   // BEAM: Could not validate the saved VM state at a native boundary
-  ERR_BEAM_NATIVE_BOUNDARY_INVALID = 7009,
+  ERR_BEAM_NATIVE_BOUNDARY_INVALID = 7909,
 
   // BEAM: Could not validate the saved Erlang caller of a dirty NIF
-  ERR_BEAM_DIRTY_NIF_BOUNDARY_INVALID = 7010,
+  ERR_BEAM_DIRTY_NIF_BOUNDARY_INVALID = 7910,
 
   // BEAM: Could not validate the caller frame at a shared light BIF
-  ERR_BEAM_LIGHT_BIF_BOUNDARY_INVALID = 7011,
+  ERR_BEAM_LIGHT_BIF_BOUNDARY_INVALID = 7911,
 
   // BEAM: Could not validate the caller frame at a shared guard BIF
-  ERR_BEAM_GUARD_BIF_BOUNDARY_INVALID = 7012,
+  ERR_BEAM_GUARD_BIF_BOUNDARY_INVALID = 7912,
 
   // BEAM: Could not validate the caller frame at a garbage collection boundary
-  ERR_BEAM_GARBAGE_COLLECT_BOUNDARY_INVALID = 7013,
+  ERR_BEAM_GARBAGE_COLLECT_BOUNDARY_INVALID = 7913,
 
   // BEAM: Unexpected frame state at the scheduler's JIT entry
-  ERR_BEAM_PROCESS_MAIN_BOUNDARY_INVALID = 7014,
+  ERR_BEAM_PROCESS_MAIN_BOUNDARY_INVALID = 7914,
 
   // BEAM: Could not validate the caller frame at a shared map update
-  ERR_BEAM_MAP_UPDATE_BOUNDARY_INVALID = 7015,
+  ERR_BEAM_MAP_UPDATE_BOUNDARY_INVALID = 7915,
 
   // BEAM: Cannot continue unwinding through shared exception handling
-  ERR_BEAM_SHARED_EXCEPTION_UNWIND = 7016,
+  ERR_BEAM_SHARED_EXCEPTION_UNWIND = 7916,
 
   // BEAM: No validated unwind rule for this global JIT code
-  ERR_BEAM_GLOBAL_JIT_UNHANDLED = 7017,
+  ERR_BEAM_GLOBAL_JIT_UNHANDLED = 7917,
 
   // BEAM: Code range snapshot is inconsistent
-  ERR_BEAM_RANGE_SNAPSHOT_CHANGED = 7018,
+  ERR_BEAM_RANGE_SNAPSHOT_CHANGED = 7918,
 
   // BEAM: Could not validate the caller frame at an ordinary NIF boundary
-  ERR_BEAM_CALL_NIF_BOUNDARY_INVALID = 7019,
+  ERR_BEAM_CALL_NIF_BOUNDARY_INVALID = 7919,
 
   // BEAM: Could not validate the caller frame at a shared body BIF
-  ERR_BEAM_BODY_BIF_BOUNDARY_INVALID = 7020,
+  ERR_BEAM_BODY_BIF_BOUNDARY_INVALID = 7920,
 
   // BEAM: ARM Erlang frame sampled before its return address was saved
-  ERR_BEAM_ARM_FRAME_ENTRY_UNSAVED = 7021,
+  ERR_BEAM_ARM_FRAME_ENTRY_UNSAVED = 7921,
 
   // BEAM: Could not validate an ARM Erlang frame after its return address was restored
-  ERR_BEAM_ARM_FRAME_EXIT_INVALID = 7022,
+  ERR_BEAM_ARM_FRAME_EXIT_INVALID = 7922,
 
   // BEAM: Could not read the sampled ARM instruction
-  ERR_BEAM_INSTRUCTION_READ_FAILURE = 7023,
+  ERR_BEAM_INSTRUCTION_READ_FAILURE = 7923,
 
   // BEAM: Could not read the Erlang stack during frame scanning
-  ERR_BEAM_STACK_READ_FAILURE = 7024,
+  ERR_BEAM_STACK_READ_FAILURE = 7924,
 
   // LuaJIT: No entry for this process exists in the LuaJIT process info array
   ERR_LUAJIT_NO_PROC_INFO = 8000,

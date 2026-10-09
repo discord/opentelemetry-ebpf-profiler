@@ -386,92 +386,92 @@
     "description": "BEAM: Ran out of iterations searching for the current code header"
   },
   {
-    "id": 7007,
+    "id": 7907,
     "name": "beam_fp_transition_invalid",
     "description": "BEAM: Could not safely unwind a frame-pointer transition"
   },
   {
-    "id": 7008,
+    "id": 7908,
     "name": "beam_module_range_gap",
     "description": "BEAM: PC falls in a gap between module code ranges"
   },
   {
-    "id": 7009,
+    "id": 7909,
     "name": "beam_native_boundary_invalid",
     "description": "BEAM: Could not validate the saved VM state at a native boundary"
   },
   {
-    "id": 7010,
+    "id": 7910,
     "name": "beam_dirty_nif_boundary_invalid",
     "description": "BEAM: Could not validate the saved Erlang caller of a dirty NIF"
   },
   {
-    "id": 7011,
+    "id": 7911,
     "name": "beam_light_bif_boundary_invalid",
     "description": "BEAM: Could not validate the caller frame at a shared light BIF"
   },
   {
-    "id": 7012,
+    "id": 7912,
     "name": "beam_guard_bif_boundary_invalid",
     "description": "BEAM: Could not validate the caller frame at a shared guard BIF"
   },
   {
-    "id": 7013,
+    "id": 7913,
     "name": "beam_garbage_collect_boundary_invalid",
     "description": "BEAM: Could not validate the caller frame at a garbage collection boundary"
   },
   {
-    "id": 7014,
+    "id": 7914,
     "name": "beam_process_main_boundary_invalid",
     "description": "BEAM: Unexpected frame state at the scheduler's JIT entry"
   },
   {
-    "id": 7015,
+    "id": 7915,
     "name": "beam_map_update_boundary_invalid",
     "description": "BEAM: Could not validate the caller frame at a shared map update"
   },
   {
-    "id": 7016,
+    "id": 7916,
     "name": "beam_shared_exception_unwind",
     "description": "BEAM: Cannot continue unwinding through shared exception handling"
   },
   {
-    "id": 7017,
+    "id": 7917,
     "name": "beam_global_jit_unhandled",
     "description": "BEAM: No validated unwind rule for this global JIT code"
   },
   {
-    "id": 7018,
+    "id": 7918,
     "name": "beam_range_snapshot_changed",
     "description": "BEAM: Code range snapshot is inconsistent"
   },
   {
-    "id": 7019,
+    "id": 7919,
     "name": "beam_call_nif_boundary_invalid",
     "description": "BEAM: Could not validate the caller frame at an ordinary NIF boundary"
   },
   {
-    "id": 7020,
+    "id": 7920,
     "name": "beam_body_bif_boundary_invalid",
     "description": "BEAM: Could not validate the caller frame at a shared body BIF"
   },
   {
-    "id": 7021,
+    "id": 7921,
     "name": "beam_arm_frame_entry_unsaved",
     "description": "BEAM: ARM Erlang frame sampled before its return address was saved"
   },
   {
-    "id": 7022,
+    "id": 7922,
     "name": "beam_arm_frame_exit_invalid",
     "description": "BEAM: Could not validate an ARM Erlang frame after its return address was restored"
   },
   {
-    "id": 7023,
+    "id": 7923,
     "name": "beam_instruction_read_failure",
     "description": "BEAM: Could not read the sampled ARM instruction"
   },
   {
-    "id": 7024,
+    "id": 7924,
     "name": "beam_stack_read_failure",
     "description": "BEAM: Could not read the Erlang stack during frame scanning"
   },
