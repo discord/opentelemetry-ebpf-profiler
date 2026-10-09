@@ -110,9 +110,11 @@ func canMerge(delta, nextDelta sdtypes.StackDelta) bool {
 	if nextDelta.Offset-delta.Offset > uint32(*mergeDistance) {
 		return false
 	}
-	if nextDelta.Info.BaseReg != delta.Info.BaseReg ||
+	if nextDelta.Info.Flags != delta.Info.Flags ||
+		nextDelta.Info.BaseReg != delta.Info.BaseReg ||
 		nextDelta.Info.AuxBaseReg != delta.Info.AuxBaseReg ||
-		nextDelta.Info.AuxParam != delta.Info.AuxParam {
+		nextDelta.Info.AuxParam != delta.Info.AuxParam ||
+		nextDelta.Info.X20Param != delta.Info.X20Param {
 		return false
 	}
 	deltaDiff := nextDelta.Info.Param - delta.Info.Param

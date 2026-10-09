@@ -20,6 +20,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/internal/orderedset"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
+	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
 var (
@@ -571,6 +572,33 @@ func TestGenerate_StringAndFunctionTablePopulation(t *testing.T) {
 	fn := dic.FunctionTable().At(1)
 	assert.Equal(t, funcName, dic.StringTable().At(int(fn.NameStrindex())))
 	assert.Equal(t, filePath.String(), dic.StringTable().At(int(fn.FilenameStrindex())))
+}
+
+func TestGenerate_NamedUnwindErrorLocation(t *testing.T) {
+	d, err := New(100, nil)
+	require.NoError(t, err)
+	frames := make(libpf.Frames, 0, 1)
+	frames.Append(&libpf.Frame{
+		Type:            libpf.AbortFrame,
+		AddressOrLineno: 7002,
+		FunctionName:    libpf.Intern(support.ErrorFrameName(7002)),
+	})
+	tree := samples.TraceEventsTree{
+		{}: {Events: map[*samples.TypeMetadata]samples.SampleToEvents{
+			profileTypeSampling: {
+				{}: &samples.TraceEvents{Frames: frames, Timestamps: []uint64{uint64(testCollectionStart.UnixNano())}},
+			},
+		}},
+	}
+	profiles, err := testGenerate(d, tree, "agent", "v1")
+	require.NoError(t, err)
+	dic := profiles.Dictionary()
+	require.Equal(t, 2, dic.LocationTable().Len())
+	location := dic.LocationTable().At(1)
+	assert.Equal(t, uint64(7002), location.Address())
+	require.Equal(t, 1, location.Lines().Len())
+	function := dic.FunctionTable().At(int(location.Lines().At(0).FunctionIndex()))
+	assert.Equal(t, support.ErrorFrameName(7002), dic.StringTable().At(int(function.NameStrindex())))
 }
 
 func singleFrameNative(mappingFile libpf.FrameMappingFile, lineno libpf.AddressOrLineno,

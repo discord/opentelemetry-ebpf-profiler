@@ -64,6 +64,8 @@ func newVMRegsARM() vmRegs {
 		cfa:  vmReg{arch: elf.EM_AARCH64, reg: regUndefined},
 		fp:   vmReg{arch: elf.EM_AARCH64, reg: regSame},
 		ra:   vmReg{arch: elf.EM_AARCH64, reg: regSame},
+		x20:  vmReg{arch: elf.EM_AARCH64, reg: regSame},
+		x21:  vmReg{arch: elf.EM_AARCH64, reg: regSame},
 	}
 }
 
@@ -93,6 +95,10 @@ func (regs *vmRegs) regARM(ndx uleb128) *vmReg {
 		return &regs.fp
 	case armRegLR:
 		return &regs.ra
+	case armRegX20:
+		return &regs.x20
+	case armRegX21:
+		return &regs.x21
 	default:
 		return nil
 	}
@@ -150,6 +156,31 @@ func (regs *vmRegs) getUnwindInfoARM() sdtypes.UnwindInfo {
 	}
 	if regs.ra.reg != regSame && regs.fp.reg == regs.ra.reg && regs.fp.off+8 == regs.ra.off {
 		info.Flags |= support.UnwindFlagFrame
+	}
+	switch regs.x20.reg {
+	case regSame:
+	case regCFA:
+		if regs.x20.off < -1<<31 || regs.x20.off > 1<<31-1 {
+			info.Flags |= support.UnwindFlagX20Invalid
+		} else {
+			info.Flags |= support.UnwindFlagX20CFA
+			info.X20Param = int32(regs.x20.off)
+		}
+	default:
+		info.Flags |= support.UnwindFlagX20Invalid
+	}
+	switch regs.x21.reg {
+	case regSame:
+		info.X21Rule = support.UnwindX21Same
+	case regCFA:
+		if regs.x21.off < -1<<31 || regs.x21.off > 1<<31-1 {
+			info.X21Rule = support.UnwindX21Invalid
+		} else {
+			info.X21Rule = support.UnwindX21CFA
+			info.X21Param = int32(regs.x21.off)
+		}
+	default:
+		info.X21Rule = support.UnwindX21Invalid
 	}
 
 	return info

@@ -9,9 +9,11 @@ package beam // import "go.opentelemetry.io/ebpf-profiler/interpreter/beam"
 // that share the same bytecode, such as Elixir and Gleam.
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"fmt"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -40,11 +42,16 @@ var (
 )
 
 type beamData struct {
+	processLayout       otp25ProcessLayout
+	nativeFuncLayout    otp25NativeFuncLayout
+	schedulerLayout     otp25SchedulerLayout
 	otpRelease          uint8
 	ertsVersion         string
+	runtimeFileID       uint64
 	theActiveCodeIndex  libpf.Address
 	r                   libpf.Address
 	beamNormalExit      libpf.Address
+	jitDebugDescriptor  libpf.Address
 	ertsFrameLayout     uint64
 	ertsAtomTable       uint64
 	etpPtrMask          uint64
@@ -61,7 +68,7 @@ type beamData struct {
 		// BeamCodeHeader
 		// https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/beam_code.h#L56-L125
 		beamCodeHeader struct {
-			sizeOf, numFunctions, lineTable, functions uint8
+			sizeOf, numFunctions, lineTable, md5Ptr, functions uint8
 		}
 
 		// ErtsCodeInfo
@@ -116,13 +123,14 @@ type beamMfa struct {
 type beamInstance struct {
 	interpreter.InstanceStubs
 
-	pid          libpf.PID
-	data         *beamData
-	rm           remotememory.RemoteMemory
-	atomTable    libpf.Address
-	atomCache    *freelru.LRU[uint32, libpf.String]
-	mfaNameCache *freelru.LRU[beamMfa, libpf.String]
-	stringCache  *freelru.LRU[libpf.Address, libpf.String]
+	pid                  libpf.PID
+	data                 *beamData
+	rm                   remotememory.RemoteMemory
+	atomTable            libpf.Address
+	atomCache            *freelru.LRU[uint32, libpf.String]
+	mfaNameCache         *freelru.LRU[beamMfa, libpf.String]
+	stringCache          *freelru.LRU[libpf.Address, libpf.String]
+	framePointersEnabled bool
 
 	// prefixes is indexed by the prefix added to ebpf maps (to be cleaned up) to its generation
 	prefixes map[lpm.Prefix]uint32
@@ -216,11 +224,34 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	d := &beamData{
 		otpRelease:         uint8(otpRelease),
 		ertsVersion:        string(ertsVersion[:len(ertsVersion)-1]),
+		runtimeFileID:      uint64(info.FileID()),
 		theActiveCodeIndex: libpf.Address(codeIndex.Address),
 		r:                  libpf.Address(r.Address),
 		beamNormalExit:     libpf.Address(beamNormalExit.Address),
 		ertsAtomTable:      uint64(atomTable.Address),
 		etpPtrMask:         npsr.Uint64(etpPtrMask, 0),
+	}
+	if d.otpRelease == 25 {
+		if address, err := ef.LookupSymbolAddress("__jit_debug_descriptor"); err == nil {
+			d.jitDebugDescriptor = libpf.Address(address)
+		}
+	}
+	if d.otpRelease == 25 {
+		if layout, err := readOTP25ProcessLayout(ef.Underlying()); err == nil {
+			d.processLayout = layout
+		} else {
+			log.Debugf("BEAM Process layout unavailable: %v", err)
+		}
+		if layout, err := readOTP25SchedulerLayout(ef.Underlying()); err == nil {
+			d.schedulerLayout = layout
+		} else {
+			log.Debugf("BEAM scheduler layout unavailable: %v", err)
+		}
+		if layout, err := readOTP25NativeFuncLayout(ef.Underlying()); err == nil {
+			d.nativeFuncLayout = layout
+		} else {
+			log.Debugf("BEAM native function layout unavailable: %v", err)
+		}
 	}
 
 	if otpRelease >= 28 {
@@ -273,12 +304,20 @@ func loader(ebpf interpreter.EbpfHandler, info *interpreter.LoaderInfo) (interpr
 	vms.erlHeapBits.data = 16
 
 	switch d.otpRelease {
-	case 25, 26, 27:
+	case 25, 26:
+		// OTP 25 and 26 have no coverage fields in BeamCodeHeader.
+		vms.beamCodeHeader.sizeOf = 104
+		vms.beamCodeHeader.md5Ptr = 80
+		vms.beamCodeHeader.functions = 96
+		vms.atom.name = 32
+	case 27:
 		vms.beamCodeHeader.sizeOf = 144
+		vms.beamCodeHeader.md5Ptr = 120
 		vms.beamCodeHeader.functions = 136
 		vms.atom.name = 32
 	case 28:
 		vms.beamCodeHeader.sizeOf = 160
+		vms.beamCodeHeader.md5Ptr = 136
 		vms.beamCodeHeader.functions = 152
 		vms.atom.u.bin = 32
 	default:
@@ -317,6 +356,7 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		The_active_code_index: uint64(bias + d.theActiveCodeIndex),
 		Beam_normal_exit:      normalExit,
 		Ranges_sizeof:         uint8(d.vmStructs.ranges.sizeOf),
+		Otp_release:           d.otpRelease,
 	}
 
 	// If this value is zero, it means that frame pointer support is not included in the runtime binary
@@ -325,9 +365,93 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		// https://github.com/erlang/otp/blob/OTP-27.2.4/erts/emulator/beam/erl_vm.h#L68-L73
 		data.Frame_pointers_enabled = ertsFrameLayout == 1
 	}
+	if d.otpRelease == 25 && d.jitDebugDescriptor != 0 {
+		fragments := map[string][2]*uint64{
+			"global::call_light_bif_shared":   {&data.Light_bif_start, &data.Light_bif_end},
+			"global::i_bif_guard_shared":      {&data.Guard_bif_start, &data.Guard_bif_end},
+			"global::i_bif_body_shared":       {&data.Body_bif_start, &data.Body_bif_end},
+			"global::garbage_collect":         {&data.Garbage_collect_start, &data.Garbage_collect_end},
+			"global::process_main":            {&data.Process_main_start, &data.Process_main_end},
+			"global::update_map_assoc_shared": {&data.Map_assoc_start, &data.Map_assoc_end},
+			"global::raise_exception_shared":  {&data.Raise_exception_start, &data.Raise_exception_end},
+			"global::call_nif_shared":         {&data.Call_nif_start, &data.Call_nif_end},
+		}
+		// Process-based boundaries require offsets from the matching executable.
+		if d.processLayout.stop != 0 &&
+			(runtime.GOARCH == "arm64" ||
+				(data.Frame_pointers_enabled && d.processLayout.framePointer != 0)) {
+			data.Process_stop_offset = d.processLayout.stop
+			data.Process_frame_pointer_offset = d.processLayout.framePointer
+			data.Process_i_offset = d.processLayout.i
+			data.Process_current_offset = d.processLayout.current
+			data.Process_scheduler_data_offset = d.processLayout.schedulerData
+			data.Scheduler_current_process_offset = d.schedulerLayout.currentProcess
+			data.Dirty_nif_current_offset = d.schedulerLayout.currentNIF
+			data.Native_func_trampoline_offset = d.nativeFuncLayout.trampoline
+			data.Native_func_mfa_offset = d.nativeFuncLayout.mfa
+			data.Native_func_argc_offset = d.nativeFuncLayout.argc
+		}
+		if data.Process_stop_offset != 0 {
+			fragments["global::call_bif_shared"] = [2]*uint64{&data.Heavy_bif_start, &data.Heavy_bif_end}
+			fragments["global::bif_export_trap"] = [2]*uint64{&data.Bif_export_trap_start, &data.Bif_export_trap_end}
+		}
+		names := make([]string, 0, len(fragments))
+		for name := range fragments {
+			names = append(names, name)
+		}
+		allocation, ranges, err := findOTP25GlobalJITRanges(rm, bias+d.jitDebugDescriptor, names)
+		if err != nil {
+			log.Debugf("BEAM global JIT metadata unavailable: %v", err)
+		} else {
+			data.Global_jit_start = uint64(allocation.start)
+			data.Global_jit_end = uint64(allocation.end)
+			for name, fields := range fragments {
+				if r, ok := ranges[name]; ok {
+					*fields[0], *fields[1] = uint64(r.start), uint64(r.end)
+				} else {
+					log.Debugf("BEAM JIT fragment unavailable: %s", name)
+				}
+			}
+			if runtime.GOARCH == "amd64" &&
+				(data.Heavy_bif_start == 0 || data.Bif_export_trap_start == 0) {
+				data.Heavy_bif_start, data.Heavy_bif_end = 0, 0
+			}
+		}
+	}
 
 	if err := ebpf.UpdateProcData(libpf.BEAM, pid, unsafe.Pointer(&data)); err != nil {
 		return nil, err
+	}
+	if runtime.GOARCH == "amd64" && data.Frame_pointers_enabled && data.Heavy_bif_start != 0 {
+		probePath := fmt.Sprintf("/proc/%d/exe", pid)
+		probes, ok := ebpf.(interface{ AttachBEAMBIF(uint64, string) error })
+		var probeErr error
+		if !ok {
+			probeErr = fmt.Errorf("probe handler is unavailable")
+		} else {
+			probeErr = probes.AttachBEAMBIF(d.runtimeFileID, probePath)
+		}
+		if probeErr != nil {
+			log.Debugf("BEAM BIF probes unavailable for %s: %v", probePath, probeErr)
+			data.Heavy_bif_start = 0
+			data.Heavy_bif_end = 0
+			if err := ebpf.UpdateProcData(libpf.BEAM, pid, unsafe.Pointer(&data)); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if d.otpRelease == 25 && data.Process_stop_offset != 0 && data.Dirty_nif_current_offset != 0 &&
+		(runtime.GOARCH != "arm64" ||
+			(data.Process_i_offset != 0 && data.Process_current_offset != 0 &&
+				data.Native_func_trampoline_offset != 0 && data.Native_func_mfa_offset != 0 &&
+				data.Native_func_argc_offset != 0)) &&
+		(runtime.GOARCH == "arm64" || data.Frame_pointers_enabled) {
+		probePath := fmt.Sprintf("/proc/%d/exe", pid)
+		if probes, ok := ebpf.(interface{ AttachBEAMDirtyNIF(uint64, string) error }); ok {
+			if err := probes.AttachBEAMDirtyNIF(d.runtimeFileID, probePath); err != nil {
+				log.Debugf("BEAM dirty NIF probes unavailable for %s: %v", probePath, err)
+			}
+		}
 	}
 
 	atomCache, err := freelru.New[uint32, libpf.String](
@@ -349,18 +473,25 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 	}
 
 	return &beamInstance{
-		pid:          pid,
-		data:         d,
-		rm:           rm,
-		prefixes:     make(map[lpm.Prefix]uint32),
-		atomTable:    bias + libpf.Address(d.ertsAtomTable),
-		atomCache:    atomCache,
-		mfaNameCache: mfaNameCache,
-		stringCache:  stringCache,
+		pid:                  pid,
+		data:                 d,
+		rm:                   rm,
+		prefixes:             make(map[lpm.Prefix]uint32),
+		atomTable:            bias + libpf.Address(d.ertsAtomTable),
+		atomCache:            atomCache,
+		mfaNameCache:         mfaNameCache,
+		stringCache:          stringCache,
+		framePointersEnabled: data.Frame_pointers_enabled,
 	}, nil
 }
 
-func (d *beamData) Unload(_ interpreter.EbpfHandler) {
+func (d *beamData) Unload(ebpf interpreter.EbpfHandler) {
+	if probes, ok := ebpf.(interface{ DetachBEAMBIF(uint64) }); ok {
+		probes.DetachBEAMBIF(d.runtimeFileID)
+	}
+	if probes, ok := ebpf.(interface{ DetachBEAMDirtyNIF(uint64) }); ok {
+		probes.DetachBEAMDirtyNIF(d.runtimeFileID)
+	}
 }
 
 func (i *beamInstance) UsesAnonymousMappings() bool {
@@ -434,15 +565,19 @@ func (i *beamInstance) Symbolize(ef libpf.EbpfFrame, frames *libpf.Frames, _ lib
 	if err != nil {
 		return err
 	}
+	moduleName, err := i.lookupAtom(mfa.module)
+	if err != nil {
+		return err
+	}
+	mapping, offset, err := i.moduleMapping(codeHeader, pc, moduleName)
+	if err != nil {
+		return err
+	}
 
 	var mfaName libpf.String
 	if value, ok := i.mfaNameCache.Get(mfa); ok {
 		mfaName = value
 	} else {
-		moduleName, err := i.lookupAtom(mfa.module)
-		if err != nil {
-			return err
-		}
 		functionName, err := i.lookupAtom(mfa.function)
 		if err != nil {
 			return err
@@ -463,20 +598,69 @@ func (i *beamInstance) Symbolize(ef libpf.EbpfFrame, frames *libpf.Frames, _ lib
 	if err == nil {
 		log.Debugf("BEAM Found function %s at %s:%d", mfaName, fileName, lineNumber)
 		frames.Append(&libpf.Frame{
-			Type:         libpf.BEAMFrame,
-			FunctionName: mfaName,
-			SourceFile:   fileName,
-			SourceLine:   libpf.SourceLineno(lineNumber),
+			Type:            libpf.BEAMFrame,
+			Mapping:         mapping,
+			AddressOrLineno: offset,
+			FunctionName:    mfaName,
+			SourceFile:      fileName,
+			SourceLine:      libpf.SourceLineno(lineNumber),
 		})
 	} else {
 		log.Debugf("BEAM Found function %s", mfaName)
 		frames.Append(&libpf.Frame{
-			Type:         libpf.BEAMFrame,
-			FunctionName: mfaName,
+			Type:            libpf.BEAMFrame,
+			Mapping:         mapping,
+			AddressOrLineno: offset,
+			FunctionName:    mfaName,
 		})
 	}
 
 	return nil
+}
+
+// moduleMapping gives anonymous BEAM JIT code a stable, module-relative identity.
+// OTP embeds the BEAM module checksum in each code allocation. The runtime
+// executable and frame layout qualify it because both affect generated code.
+func (i *beamInstance) moduleMapping(codeHeader, pc libpf.Address,
+	moduleName libpf.String) (libpf.FrameMapping, libpf.AddressOrLineno, error) {
+	vms := i.data.vmStructs.beamCodeHeader
+	numFunctions := i.rm.Uint32(codeHeader + libpf.Address(vms.numFunctions))
+	if numFunctions == 0 || numFunctions > 1<<20 {
+		return libpf.FrameMapping{}, 0, fmt.Errorf("BEAM invalid function count %d at %#x", numFunctions, codeHeader)
+	}
+	moduleEnd := i.rm.Ptr(codeHeader + libpf.Address(vms.functions) + libpf.Address(numFunctions)*8)
+	if moduleEnd <= codeHeader || pc < codeHeader || pc >= moduleEnd {
+		return libpf.FrameMapping{}, 0, fmt.Errorf("BEAM PC %#x outside module %#x-%#x", pc, codeHeader, moduleEnd)
+	}
+	md5Ptr := i.rm.Ptr(codeHeader + libpf.Address(vms.md5Ptr))
+	if md5Ptr == 0 {
+		return libpf.FrameMapping{}, 0, fmt.Errorf("BEAM module checksum pointer is null at %#x", codeHeader)
+	}
+	var checksum [16]byte
+	if err := i.rm.Read(md5Ptr, checksum[:]); err != nil {
+		return libpf.FrameMapping{}, 0, fmt.Errorf("BEAM module checksum read at %#x: %w", md5Ptr, err)
+	}
+
+	const domain = "BEAM-JIT-module-v1\x00"
+	var identity [len(domain) + 8 + 1 + 16]byte
+	copy(identity[:], domain)
+	binary.BigEndian.PutUint64(identity[len(domain):], i.data.runtimeFileID)
+	if i.framePointersEnabled {
+		identity[len(domain)+8] = 1
+	}
+	copy(identity[len(domain)+9:], checksum[:])
+	digest := sha256.Sum256(identity[:])
+	fileID, _ := libpf.FileIDFromBytes(digest[:16])
+	file := libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+		FileID:   fileID,
+		FileName: libpf.Intern("BEAM:" + moduleName.String()),
+	})
+	mapping := libpf.NewFrameMapping(libpf.FrameMappingData{
+		File:  file,
+		Start: 0,
+		End:   moduleEnd - codeHeader,
+	})
+	return mapping, libpf.AddressOrLineno(pc - codeHeader), nil
 }
 
 func (i *beamInstance) findMFA(pc libpf.Address, codeHeader libpf.Address) (functionIndex uint64, mfa beamMfa, err error) {
@@ -494,7 +678,7 @@ func (i *beamInstance) findMFA(pc libpf.Address, codeHeader libpf.Address) (func
 
 	ertsCodeInfo := libpf.Address(0)
 	lowIdx := uint64(0)
-	highIdx := uint64(numFunctions) - 1
+	highIdx := uint64(numFunctions)
 	for lowIdx < highIdx {
 		midIdx := lowIdx + (highIdx-lowIdx)/2
 		err := i.rm.Read(functions+libpf.Address(midIdx*8), midBuffer)
@@ -622,18 +806,42 @@ func (i *beamInstance) lookupAtom(index uint32) (libpf.String, error) {
 	}
 
 	vms := i.data.vmStructs
+	readPtr := func(addr libpf.Address) (libpf.Address, error) {
+		var buf [8]byte
+		if err := i.rm.Read(addr, buf[:]); err != nil {
+			return 0, fmt.Errorf("BEAM unable to read atom pointer at %#x for index %d: %w", addr, index, err)
+		}
+		return libpf.Address(binary.LittleEndian.Uint64(buf[:])) - i.rm.Bias, nil
+	}
 
-	segTable := i.rm.Ptr(i.atomTable + libpf.Address(vms.indexTable.segTable))
-	segment := i.rm.Ptr(segTable + libpf.Address(8*(index>>16)))
-	entry := i.rm.Ptr(segment + libpf.Address(8*((index>>6)&0x3FF)))
+	segTable, err := readPtr(i.atomTable + libpf.Address(vms.indexTable.segTable))
+	if err != nil {
+		return libpf.NullString, err
+	}
+	segment, err := readPtr(segTable + libpf.Address(8*(index>>16)))
+	if err != nil {
+		return libpf.NullString, err
+	}
+	entry, err := readPtr(segment + libpf.Address(8*((index>>6)&0x3FF)))
+	if err != nil {
+		return libpf.NullString, err
+	}
 
-	len := i.rm.Uint16(entry + libpf.Address(vms.atom.len))
+	var length [2]byte
+	if err := i.rm.Read(entry+libpf.Address(vms.atom.len), length[:]); err != nil {
+		return libpf.NullString, fmt.Errorf("BEAM unable to read atom length for index %d: %w", index, err)
+	}
+	len := binary.LittleEndian.Uint16(length[:])
 
 	name := make([]byte, len)
 	switch i.data.otpRelease {
 	case 28:
 		// Implementation based on https://github.com/erlang/otp/blob/OTP-28.0.2/erts/etc/unix/etp-commands.in#L657-L674
-		unboxed := i.rm.Ptr(entry+libpf.Address(vms.atom.u.bin)) & libpf.Address(i.data.etpPtrMask)
+		unboxed, err := readPtr(entry + libpf.Address(vms.atom.u.bin))
+		if err != nil {
+			return libpf.NullString, err
+		}
+		unboxed &= libpf.Address(i.data.etpPtrMask)
 
 		subtag := i.rm.Uint64(unboxed) & uint64(i.data.etpHeaderSubtagMask)
 		if subtag == uint64(i.data.etpHeapBitsSubtag) {
@@ -645,7 +853,11 @@ func (i *beamInstance) lookupAtom(index uint32) (libpf.String, error) {
 			return libpf.NullString, fmt.Errorf("BEAM Unable to lookup atom with index %d: expected boxed value subtag 0x%x, found 0x%x", index, i.data.etpHeapBitsSubtag, subtag)
 		}
 	default:
-		err := i.rm.Read(i.rm.Ptr(entry+libpf.Address(vms.atom.name)), name)
+		namePtr, err := readPtr(entry + libpf.Address(vms.atom.name))
+		if err != nil {
+			return libpf.NullString, err
+		}
+		err = i.rm.Read(namePtr, name)
 		if err != nil {
 			return libpf.NullString, fmt.Errorf("BEAM Unable to lookup atom with index %d: %v", index, err)
 		}

@@ -185,19 +185,55 @@ type UnwindInfo struct {
 	MergeOpcode uint8
 	Param       int32
 	AuxParam    int32
+	X20Param    int32
+	X21Param    int32
+	X21Rule     uint8
+	Pad_cgo_0   [3]byte
 }
 
 type ApmIntProcInfo struct {
 	Offset uint64
 }
 type BEAMProcInfo struct {
-	Bias                   uint64
-	R                      uint64
-	The_active_code_index  uint64
-	Beam_normal_exit       uint64
-	Frame_pointers_enabled bool
-	Ranges_sizeof          uint8
-	Pad_cgo_0              [6]byte
+	Bias                             uint64
+	Global_jit_start                 uint64
+	Global_jit_end                   uint64
+	R                                uint64
+	The_active_code_index            uint64
+	Beam_normal_exit                 uint64
+	Light_bif_start                  uint64
+	Light_bif_end                    uint64
+	Heavy_bif_start                  uint64
+	Heavy_bif_end                    uint64
+	Guard_bif_start                  uint64
+	Guard_bif_end                    uint64
+	Body_bif_start                   uint64
+	Body_bif_end                     uint64
+	Garbage_collect_start            uint64
+	Garbage_collect_end              uint64
+	Process_main_start               uint64
+	Process_main_end                 uint64
+	Map_assoc_start                  uint64
+	Map_assoc_end                    uint64
+	Raise_exception_start            uint64
+	Raise_exception_end              uint64
+	Call_nif_start                   uint64
+	Call_nif_end                     uint64
+	Bif_export_trap_start            uint64
+	Bif_export_trap_end              uint64
+	Frame_pointers_enabled           bool
+	Ranges_sizeof                    uint8
+	Otp_release                      uint8
+	Process_stop_offset              uint16
+	Process_frame_pointer_offset     uint16
+	Process_i_offset                 uint16
+	Process_current_offset           uint16
+	Dirty_nif_current_offset         uint16
+	Process_scheduler_data_offset    uint16
+	Scheduler_current_process_offset uint16
+	Native_func_trampoline_offset    uint16
+	Native_func_mfa_offset           uint16
+	Native_func_argc_offset          uint16
 }
 type DotnetProcInfo struct {
 	Version uint32
@@ -374,10 +410,16 @@ const (
 	UnwindRegX86RDI  uint8 = 0x7
 	UnwindRegX86R8   uint8 = 0x8
 
-	UnwindFlagCommand  uint8 = 0x1
-	UnwindFlagFrame    uint8 = 0x2
-	UnwindFlagLeafOnly uint8 = 0x4
-	UnwindFlagDerefCfa uint8 = 0x8
+	UnwindFlagCommand    uint8 = 0x1
+	UnwindFlagFrame      uint8 = 0x2
+	UnwindFlagLeafOnly   uint8 = 0x4
+	UnwindFlagDerefCfa   uint8 = 0x8
+	UnwindFlagRegisterRA uint8 = 0x10
+	UnwindFlagX20CFA     uint8 = 0x20
+	UnwindFlagX20Invalid uint8 = 0x40
+	UnwindX21Same        uint8 = 0x0
+	UnwindX21CFA         uint8 = 0x1
+	UnwindX21Invalid     uint8 = 0x2
 
 	UnwindCommandInvalid      int32 = 0x0
 	UnwindCommandStop         int32 = 0x1

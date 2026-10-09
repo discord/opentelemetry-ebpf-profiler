@@ -420,6 +420,7 @@ unwind_one_frame(PerCPURecord *record, bool *stop, bool *delegate_command)
       state->fp  = rt_regs[29];
       state->lr  = normalize_pac_ptr(rt_regs[30]);
       state->r20 = rt_regs[20];
+      state->r21 = rt_regs[21];
       state->r22 = rt_regs[22];
       state->r28 = rt_regs[28];
 
@@ -456,6 +457,30 @@ unwind_one_frame(PerCPURecord *record, bool *stop, bool *delegate_command)
 
   // Resolve the frame CFA (previous PC is fixed to CFA) address
   state->cfa = unwind_calc_register(state, info->baseReg, param);
+
+  if (info->flags & UNWIND_FLAG_X20_CFA) {
+    u64 saved_x20 = 0;
+    if (bpf_probe_read_user(
+          &saved_x20, sizeof(saved_x20), (void *)(state->cfa + (u64)(s64)info->x20Param))) {
+      state->r20 = 0;
+    } else {
+      state->r20 = saved_x20;
+    }
+  } else if (info->flags & UNWIND_FLAG_X20_INVALID) {
+    state->r20 = 0;
+  }
+
+  if (info->x21Rule == UNWIND_X21_CFA) {
+    u64 saved_x21 = 0;
+    if (bpf_probe_read_user(
+          &saved_x21, sizeof(saved_x21), (void *)(state->cfa + (u64)(s64)info->x21Param))) {
+      state->r21 = 0;
+    } else {
+      state->r21 = saved_x21;
+    }
+  } else if (info->x21Rule == UNWIND_X21_INVALID) {
+    state->r21 = 0;
+  }
 
   // Resolve Return Address, it is either the value of link register or
   // stack address where RA is stored

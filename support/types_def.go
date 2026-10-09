@@ -158,10 +158,16 @@ const (
 	UnwindRegX86R8   uint8 = C.UNWIND_REG_X86_R8
 
 	// UnwindFlag values from the C header file
-	UnwindFlagCommand  uint8 = C.UNWIND_FLAG_COMMAND
-	UnwindFlagFrame    uint8 = C.UNWIND_FLAG_FRAME
-	UnwindFlagLeafOnly uint8 = C.UNWIND_FLAG_LEAF_ONLY
-	UnwindFlagDerefCfa uint8 = C.UNWIND_FLAG_DEREF_CFA
+	UnwindFlagCommand    uint8 = C.UNWIND_FLAG_COMMAND
+	UnwindFlagFrame      uint8 = C.UNWIND_FLAG_FRAME
+	UnwindFlagLeafOnly   uint8 = C.UNWIND_FLAG_LEAF_ONLY
+	UnwindFlagDerefCfa   uint8 = C.UNWIND_FLAG_DEREF_CFA
+	UnwindFlagRegisterRA uint8 = C.UNWIND_FLAG_REGISTER_RA
+	UnwindFlagX20CFA     uint8 = C.UNWIND_FLAG_X20_CFA
+	UnwindFlagX20Invalid uint8 = C.UNWIND_FLAG_X20_INVALID
+	UnwindX21Same        uint8 = C.UNWIND_X21_SAME
+	UnwindX21CFA         uint8 = C.UNWIND_X21_CFA
+	UnwindX21Invalid     uint8 = C.UNWIND_X21_INVALID
 
 	// UnwindCommands from the C header file
 	UnwindCommandInvalid      int32 = C.UNWIND_COMMAND_INVALID

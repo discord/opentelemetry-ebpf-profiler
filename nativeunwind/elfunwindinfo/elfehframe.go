@@ -466,7 +466,8 @@ type vmRegs struct {
 	cfa  vmReg
 	// generic (platform independent) DWARF registers for frame pointer
 	// and return address access
-	fp, ra vmReg
+	fp, ra   vmReg
+	x20, x21 vmReg
 }
 
 // reg returns the address to vmReg description of the given numeric register
