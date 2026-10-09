@@ -372,7 +372,9 @@ beam_arm_fragment_callsite(u64 caller, u64 fragment, BEAMRangesSearchCache *rang
   u32 shift    = (instructions[0] >> 21) & 3;
   u64 resolved = (u64)((instructions[0] >> 5) & 0xffff) << (shift * 16);
   u32 seen     = 1U << shift;
-  #pragma unroll
+  #ifndef TESTING_COREDUMP
+    #pragma unroll
+  #endif
   for (int i = 1; i < 5; i++) {
     u32 instruction = instructions[i];
     if (instruction == 0xd61f01c0) {
