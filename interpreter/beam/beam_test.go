@@ -23,7 +23,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/support"
-	"go.opentelemetry.io/ebpf-profiler/traceutil"
 )
 
 type procDataRecorder struct {
@@ -381,7 +380,7 @@ func TestModuleMappingIdentityAcrossRelocation(t *testing.T) {
 	traceHash := func(f libpf.Frame) libpf.TraceHash {
 		trace := &libpf.Trace{}
 		trace.Frames.Append(&f)
-		return traceutil.HashTrace(trace)
+		return trace.Hash()
 	}
 	first, firstBase := newInstance(0x100, 0x41, 0x1234, false)
 	relocated, relocatedBase := newInstance(0x1000, 0x41, 0x1234, false)

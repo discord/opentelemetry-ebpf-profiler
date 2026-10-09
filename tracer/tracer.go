@@ -13,6 +13,7 @@ import (
 	"math/rand/v2"
 	"os"
 	"path"
+	"runtime"
 	"slices"
 	"strings"
 	"sync"
@@ -555,12 +556,12 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *orig
 	}
 
 	if !cfg.InterpretersConfig.BEAM.IsDisabled() {
-		beamProbe := []progLoaderHelper{
-			{name: "beam_dirty_nif_enter", noTailCallTarget: true, enable: true},
+		beamProbe := []ProgLoaderHelper{
+			{Name: "beam_dirty_nif_enter", NoTailCallTarget: true, Enable: true},
 		}
 		if runtime.GOARCH == "amd64" {
-			beamProbe = append(beamProbe, progLoaderHelper{
-				name: "beam_bif_enter", noTailCallTarget: true, enable: true,
+			beamProbe = append(beamProbe, ProgLoaderHelper{
+				Name: "beam_bif_enter", NoTailCallTarget: true, Enable: true,
 			})
 		}
 		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], beamProbe,

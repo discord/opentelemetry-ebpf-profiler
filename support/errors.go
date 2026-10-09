@@ -50,6 +50,7 @@ var unwindErrorFrameNames = map[uint64]string{
 	3031: "[unwind error 3031: Ruby: Unable to read current vm]",
 	3032: "[unwind error 3032: Ruby: Unable to read objspace handle]",
 	3033: "[unwind error 3033: Ruby: Unable to read objspace flags]",
+	3034: "[unwind error 3034: Ruby: Native resume requested after Ruby JIT, but unwinding was stopped because JIT frames cannot resume native unwinding]",
 	4000: "[unwind error 4000: Native: Unable to find the code section in the stack delta page info map]",
 	4001: "[unwind error 4001: Native: Unable to look up the outer stack delta map (invalid map ID)]",
 	4002: "[unwind error 4002: Native: Unable to look up the inner stack delta map (unknown text section ID)]",
@@ -104,6 +105,9 @@ var unwindErrorFrameNames = map[uint64]string{
 	7923: "[unwind error 7923: BEAM: Could not read the sampled ARM instruction]",
 	7924: "[unwind error 7924: BEAM: Could not read the Erlang stack during frame scanning]",
 	8000: "[unwind error 8000: LuaJIT: No entry for this process exists in the LuaJIT process info array]",
+	9000: "[unwind error 9000: Go: required runtime offsets or layout are missing or invalid]",
+	9001: "[unwind error 9001: Go: asmcgocall unwind could not recover the caller frame]",
+	9002: "[unwind error 9002: Go: failed to read g and runtime.m prefix]",
 }
 
 // ErrorFrameName returns a stable, descriptive name for an unwind error code.

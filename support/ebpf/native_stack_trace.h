@@ -460,7 +460,8 @@ unwind_one_frame(PerCPURecord *record, bool *stop, bool *delegate_command)
 
   if (info->flags & UNWIND_FLAG_X20_CFA) {
     u64 saved_x20 = 0;
-    if (bpf_probe_read_user(&saved_x20, sizeof(saved_x20), (void *)(state->cfa + info->x20Param))) {
+    if (bpf_probe_read_user(
+          &saved_x20, sizeof(saved_x20), (void *)(state->cfa + (u64)(s64)info->x20Param))) {
       state->r20 = 0;
     } else {
       state->r20 = saved_x20;
@@ -471,7 +472,8 @@ unwind_one_frame(PerCPURecord *record, bool *stop, bool *delegate_command)
 
   if (info->x21Rule == UNWIND_X21_CFA) {
     u64 saved_x21 = 0;
-    if (bpf_probe_read_user(&saved_x21, sizeof(saved_x21), (void *)(state->cfa + info->x21Param))) {
+    if (bpf_probe_read_user(
+          &saved_x21, sizeof(saved_x21), (void *)(state->cfa + (u64)(s64)info->x21Param))) {
       state->r21 = 0;
     } else {
       state->r21 = saved_x21;

@@ -13,14 +13,14 @@ import (
 
 func TestCalculateMergeOpcodeRequiresSameRegisterRules(t *testing.T) {
 	first := stackdeltatypes.StackDelta{
-		Address: 0x100,
+		Offset: 0x100,
 		Info: stackdeltatypes.UnwindInfo{
 			BaseReg: support.UnwindRegSp,
 			Param:   8,
 		},
 	}
 	second := first
-	second.Address++
+	second.Offset++
 	second.Info.Param += 8
 
 	require.Equal(t, uint8(1), calculateMergeOpcode(first, second))

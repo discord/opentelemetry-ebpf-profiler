@@ -113,13 +113,13 @@ static EBPF_INLINE BEAMFPTransition beam_fp_transition(UnwindState *state, BEAMR
   // short and near jumps only if their target starts with the FP prologue.
   u64 target = 0;
   if ((insn & 0xff) == 0xeb) {
-    target = pc + 2 + (s8)((insn >> 8) & 0xff);
+    target = pc + 2 + (u64)(s64)(s8)((insn >> 8) & 0xff);
   } else if ((insn & 0xff) == 0xe9) {
     s32 rel;
     if (bpf_probe_read_user(&rel, sizeof(rel), (void *)(pc + 1))) {
       return BEAM_FP_UNREADABLE;
     }
-    target = pc + 5 + rel;
+    target = pc + 5 + (u64)(s64)rel;
   }
   if (target >= range->start && target < range->end && range->end - target >= 4) {
     u32 prologue;
@@ -343,7 +343,7 @@ beam_arm_fragment_callsite(u64 caller, u64 fragment, BEAMRangesSearchCache *rang
   }
 
   s32 displacement = (s32)(call << 6) >> 6;
-  u64 target       = caller - sizeof(call) + (s64)displacement * 4;
+  u64 target       = caller - sizeof(call) + (u64)((s64)displacement * 4);
   if (target == fragment) {
     return true;
   }
@@ -358,7 +358,7 @@ beam_arm_fragment_callsite(u64 caller, u64 fragment, BEAMRangesSearchCache *rang
   }
   if ((instructions[0] & 0xfc000000) == 0x14000000) {
     displacement = (s32)(instructions[0] << 6) >> 6;
-    target += (s64)displacement * 4;
+    target += (u64)((s64)displacement * 4);
     if (
       target < ranges->first.start || target >= ranges->last.end ||
       bpf_probe_read_user(instructions, sizeof(instructions), (void *)target)) {
