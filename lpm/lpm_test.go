@@ -40,6 +40,10 @@ func TestCalculatePrefixList(t *testing.T) {
 	}{
 		"4k to 0": {start: 4096, end: 0, err: true},
 		"0 to 2":  {start: 0, end: 2, expect: []Prefix{{0, 63}}},
+		"high address": {start: 0x8000000000000000, end: 0x8000000000001000,
+			expect: []Prefix{{0x8000000000000000, 52}}},
+		"near uint64 maximum": {start: ^uint64(0) - 1, end: ^uint64(0),
+			expect: []Prefix{{^uint64(0) - 1, 64}}},
 		"10 to 22": {start: 0b1010, end: 0b10110,
 			expect: []Prefix{{0b1010, 63}, {0b1100, 62}, {0b10000, 62},
 				{0b10100, 63}}},
@@ -65,4 +69,30 @@ func TestCalculatePrefixList(t *testing.T) {
 			assert.Equal(t, test.expect, prefixes)
 		})
 	}
+}
+
+func TestCalculatePrefixListObservedOverflowRange(t *testing.T) {
+	const start uint64 = 2
+	const end uint64 = 0xbd6757a600000000
+	const highBit uint64 = 1 << 63
+
+	// Check the overflowing step first, so the old implementation fails here
+	// instead of hanging in CalculatePrefixList.
+	require.Equal(t, uint64(1)<<61, calculateRmb(highBit, end))
+
+	prefixes, err := CalculatePrefixList(start, end)
+	require.NoError(t, err)
+	require.Len(t, prefixes, 81)
+	assert.Equal(t, Prefix{Key: highBit, Length: 3}, prefixes[62])
+
+	covered := start
+	for _, prefix := range prefixes {
+		require.Equal(t, covered, prefix.Key)
+		require.GreaterOrEqual(t, prefix.Length, uint32(1))
+		require.LessOrEqual(t, prefix.Length, uint32(64))
+		blockSize := uint64(1) << (64 - prefix.Length)
+		require.LessOrEqual(t, blockSize, end-covered)
+		covered += blockSize
+	}
+	assert.Equal(t, end, covered)
 }
