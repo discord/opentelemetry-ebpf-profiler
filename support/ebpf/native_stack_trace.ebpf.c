@@ -138,6 +138,7 @@ struct stack_delta_page_to_info_t {
   __uint(max_entries, 40000);
 } stack_delta_page_to_info SEC(".maps");
 
+#include "beam_dirty_nif.h"
 #include "native_stack_trace.h"
 
 // unwind_native is the tail call destination for PROG_UNWIND_NATIVE.
@@ -178,7 +179,11 @@ static EBPF_INLINE int unwind_native(struct pt_regs *ctx)
     bool stop;
     // This program implements every command, so no frame is delegated.
     error = unwind_one_frame(record, &stop, NULL);
-    if (error || stop) {
+    if (error) {
+      break;
+    }
+    if (stop) {
+      error = beam_try_dirty_nif_boundary(record, &unwinder);
       break;
     }
 

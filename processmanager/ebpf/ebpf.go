@@ -41,6 +41,11 @@ const (
 )
 
 type ebpfMapsImpl struct {
+	beamBIFEntryProgram   *cebpf.Program
+	beamDirtyEntryProgram *cebpf.Program
+	beamProbeLock         sync.Mutex
+	beamProbeLinks        map[uint64]*beamBIFProbeLinks
+	beamDirtyLinks        map[uint64]*beamDirtyProbeLinks
 	// Interpreter related eBPF maps
 	InterpreterOffsets *cebpf.Map `name:"interpreter_offsets"`
 	DotnetProcs        *cebpf.Map `name:"dotnet_procs"`
@@ -85,9 +90,14 @@ var _ ebpfapi.EbpfHandler = &ebpfMapsImpl{}
 // It further spawns background workers for deferred map updates; the given
 // context can be used to terminate them on shutdown.
 func LoadMaps(ctx context.Context, interpretersConfig interpreterconfig.Config,
-	maps map[string]*cebpf.Map, stackdeltaInnerMapSpec *cebpf.MapSpec) (ebpfapi.EbpfHandler, error) {
+	maps map[string]*cebpf.Map, programs map[string]*cebpf.Program,
+	stackdeltaInnerMapSpec *cebpf.MapSpec) (ebpfapi.EbpfHandler, error) {
 	impl := &ebpfMapsImpl{
 		stackdeltaInnerMapTemplate: stackdeltaInnerMapSpec,
+		beamBIFEntryProgram:        programs["beam_bif_enter"],
+		beamDirtyEntryProgram:      programs["beam_dirty_nif_enter"],
+		beamProbeLinks:             make(map[uint64]*beamBIFProbeLinks),
+		beamDirtyLinks:             make(map[uint64]*beamDirtyProbeLinks),
 	}
 	impl.errCounter = make(map[metrics.MetricID]int64)
 

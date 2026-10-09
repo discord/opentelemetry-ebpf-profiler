@@ -145,6 +145,7 @@ var onlineCPUsOnce = sync.OnceValues(getOnlineCPUIDs)
 // Tracer provides an interface for loading and initializing the eBPF components as
 // well as for monitoring the output maps for new traces and count updates.
 type Tracer struct {
+	beamProbeCloser interface{ CloseBEAMProbes() }
 	// ebpfMaps holds the currently loaded eBPF maps.
 	ebpfMaps map[string]*cebpf.Map
 	// ebpfProgs holds the currently loaded eBPF programs.
@@ -348,7 +349,8 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 		return nil, fmt.Errorf("failed to load eBPF code: %v", err)
 	}
 
-	ebpfHandler, err := pmebpf.LoadMaps(ctx, cfg.InterpretersConfig, ebpfMaps, stackdeltaInnerMapSpec)
+	ebpfHandler, err := pmebpf.LoadMaps(ctx, cfg.InterpretersConfig, ebpfMaps, ebpfProgs,
+		stackdeltaInnerMapSpec)
 	if err != nil {
 		return nil, fmt.Errorf("failed to load eBPF maps: %v", err)
 	}
@@ -374,10 +376,12 @@ func NewTracer(ctx context.Context, cfg *Config) (*Tracer, error) {
 	}
 
 	perfEventList := []*perf.Event{}
+	beamProbeCloser, _ := ebpfHandler.(interface{ CloseBEAMProbes() })
 
 	tracer := &Tracer{
 		lifecycleCtx:           lifecycleCtx,
 		lifecycleCancel:        lifecycleCancel,
+		beamProbeCloser:        beamProbeCloser,
 		kernelSymbolizer:       kernelSymbolizer,
 		processManager:         processManager,
 		triggerPIDProcessing:   make(chan bool, 1),
@@ -433,6 +437,9 @@ func (t *Tracer) Close() {
 		delete(h.m, hp)
 	}
 	t.hooks.WUnlock(&h)
+	if t.beamProbeCloser != nil {
+		t.beamProbeCloser.CloseBEAMProbes()
+	}
 
 	t.processManager.Close()
 	t.kernelSymbolizer.Close()
@@ -545,6 +552,22 @@ func initializeMapsAndPrograms(kmod *kallsyms.Module, cfg *Config, origins *orig
 		cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(),
 		ebpfMaps["per_cpu_records"].FD(), ebpfMaps["per_cpu_records_kp"]); err != nil {
 		return nil, nil, nil, fmt.Errorf("failed to load kprobe eBPF programs: %v", err)
+	}
+
+	if !cfg.InterpretersConfig.BEAM.IsDisabled() {
+		beamProbe := []progLoaderHelper{
+			{name: "beam_dirty_nif_enter", noTailCallTarget: true, enable: true},
+		}
+		if runtime.GOARCH == "amd64" {
+			beamProbe = append(beamProbe, progLoaderHelper{
+				name: "beam_bif_enter", noTailCallTarget: true, enable: true,
+			})
+		}
+		if err = loadProbeUnwinders(coll, ebpfProgs, ebpfMaps["kprobe_progs"], beamProbe,
+			cfg.BPFVerifierLogLevel, ebpfMaps["perf_progs"].FD(),
+			ebpfMaps["per_cpu_records"].FD(), ebpfMaps["per_cpu_records_kp"]); err != nil {
+			return nil, nil, nil, fmt.Errorf("failed to load BEAM probes: %v", err)
+		}
 	}
 
 	if err = removeTemporaryMaps(ebpfMaps); err != nil {

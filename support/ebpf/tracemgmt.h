@@ -1075,6 +1075,7 @@ copy_state_regs(UnwindState *state, struct pt_regs *regs, bool interrupted_kerne
   state->fp  = regs->regs[29];
   state->lr  = normalize_pac_ptr(regs->regs[30]);
   state->r20 = regs->regs[20];
+  state->r21 = regs->regs[21];
   state->r22 = regs->regs[22];
   state->r28 = regs->regs[28];
 

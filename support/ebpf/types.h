@@ -603,13 +603,52 @@ typedef struct V8ProcInfo {
 // BEAMProcInfo is a container for the data needed to build a stack trace for a BEAM process.
 typedef struct BEAMProcInfo {
   u64 bias;
+  u64 global_jit_start;
+  u64 global_jit_end;
   u64 r;
   u64 the_active_code_index;
   u64 beam_normal_exit;
+  u64 light_bif_start;
+  u64 light_bif_end;
+  u64 heavy_bif_start;
+  u64 heavy_bif_end;
+  u64 guard_bif_start;
+  u64 guard_bif_end;
+  u64 body_bif_start;
+  u64 body_bif_end;
+  u64 garbage_collect_start;
+  u64 garbage_collect_end;
+  u64 process_main_start;
+  u64 process_main_end;
+  u64 map_assoc_start;
+  u64 map_assoc_end;
+  u64 raise_exception_start;
+  u64 raise_exception_end;
+  u64 call_nif_start;
+  u64 call_nif_end;
+  u64 bif_export_trap_start;
+  u64 bif_export_trap_end;
   bool frame_pointers_enabled;
   // Introspection Struct Offsets
   u8 ranges_sizeof;
+  u8 otp_release;
+  u16 process_stop_offset;
+  u16 process_frame_pointer_offset;
+  u16 process_i_offset;
+  u16 process_current_offset;
+  u16 dirty_nif_current_offset;
+  u16 process_scheduler_data_offset;
+  u16 scheduler_current_process_offset;
+  u16 native_func_trampoline_offset;
+  u16 native_func_mfa_offset;
+  u16 native_func_argc_offset;
 } BEAMProcInfo;
+
+typedef struct BEAMDirtyNIFContext {
+  u64 scheduler;
+  u64 process;
+  u64 entry_i;
+} BEAMDirtyNIFContext;
 
 // Stub until we land the full LuaJIT interpreter.
 typedef struct LuaJITProcInfo {
@@ -748,7 +787,7 @@ typedef struct UnwindState {
 #if defined(__x86_64__)
       u64 rax, rdi, r8, r9, r11, r13, r15;
 #elif defined(__aarch64__)
-      u64 r20, r22, r28;
+      u64 r20, r21, r22, r28;
 #endif
     };
   };
@@ -984,8 +1023,15 @@ typedef struct UnwindInfo {
   u8 auxBaseReg;  // base register to calculate FP (x86-64) or RA[+FP] (aarch64)
   u8 mergeOpcode; // opcode for generating next stack delta, see below
   s32 param;      // parameter for the CFA expression
-  s32 auxParam;   // parameter for the FP expression
+  s32 auxParam;   // parameter for the FP or return address expression
+  s32 x20Param;   // aarch64: offset of saved x20 from CFA
+  s32 x21Param;   // aarch64: offset of saved x21 from CFA
+  u8 x21Rule;     // aarch64: UNWIND_X21_*
 } UnwindInfo;
+
+#define UNWIND_X21_SAME    0
+#define UNWIND_X21_CFA     1
+#define UNWIND_X21_INVALID 2
 
 // UNWIND_REF_* values are used for 'baseReg' and auxBaseReg'.
 // This must be in sync with the registers struct in struct UnwindState.
@@ -1011,7 +1057,12 @@ typedef struct UnwindInfo {
 // Flag to indicate that unwinding is valid on leaf frames only (uses untracked register)
 #define UNWIND_FLAG_LEAF_ONLY (1 << 2)
 // Flag to indicate that the resolve CFA value should be dereferenced
-#define UNWIND_FLAG_DEREF_CFA (1 << 3)
+#define UNWIND_FLAG_DEREF_CFA   (1 << 3)
+// Flag to indicate that the return address is in a register
+#define UNWIND_FLAG_REGISTER_RA (1 << 4)
+// aarch64 x20 is saved at CFA + x20Param, or cannot be restored.
+#define UNWIND_FLAG_X20_CFA     (1 << 5)
+#define UNWIND_FLAG_X20_INVALID (1 << 6)
 
 // If flags has UNWIND_FLAG_DEREF_CFA set, the lowest bits of 'param' are used
 // as second adder as post-deref operation. This contains the mask for that.

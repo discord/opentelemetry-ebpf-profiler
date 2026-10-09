@@ -35,6 +35,7 @@ import (
 	eim "go.opentelemetry.io/ebpf-profiler/processmanager/execinfomanager"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
+	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/times"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
@@ -431,6 +432,7 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace, profileType *sa
 		if frame.Flags().Error() {
 			if !pm.filterErrorFrames {
 				trace.Frames.Append(&libpf.Frame{
+					FunctionName:    libpf.Intern(support.ErrorFrameName(frame.Data())),
 					Type:            frame.Type().Error(),
 					AddressOrLineno: libpf.AddressOrLineno(frame.Data()),
 				})

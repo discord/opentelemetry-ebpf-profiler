@@ -64,7 +64,7 @@ func (fmf FrameMappingFile) Value() FrameMappingFileData {
 	return fmf.value.Value()
 }
 
-// FrameMappingData contains file backed mapping data.
+// FrameMappingData contains file-backed or synthetic code mapping data.
 type FrameMappingData struct {
 	// File is a reference to data about the backing file.
 	File FrameMappingFile
@@ -103,8 +103,8 @@ type Frame struct {
 	FunctionName String
 	// SourceFile is the source code file name for the frame.
 	SourceFile String
-	// Mapping is a reference to the mapping data to which this Frame corresponds to.
-	// Available only for frames executing on a file backed memory mapping.
+	// Mapping identifies the code containing this frame, including synthetic
+	// mappings for JIT-generated code.
 	Mapping FrameMapping
 	// SourceLine is the source code level line number of this frame.
 	SourceLine SourceLineno

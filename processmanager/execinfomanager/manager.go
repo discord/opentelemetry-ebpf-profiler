@@ -468,9 +468,13 @@ func calculateMergeOpcode(delta, nextDelta sdtypes.StackDelta) uint8 {
 	if addrDiff < 1 || addrDiff > 2 {
 		return 0
 	}
-	if nextDelta.Info.BaseReg != delta.Info.BaseReg ||
+	if nextDelta.Info.Flags != delta.Info.Flags ||
+		nextDelta.Info.BaseReg != delta.Info.BaseReg ||
 		nextDelta.Info.AuxBaseReg != delta.Info.AuxBaseReg ||
-		nextDelta.Info.AuxParam != delta.Info.AuxParam {
+		nextDelta.Info.AuxParam != delta.Info.AuxParam ||
+		nextDelta.Info.X20Param != delta.Info.X20Param ||
+		nextDelta.Info.X21Param != delta.Info.X21Param ||
+		nextDelta.Info.X21Rule != delta.Info.X21Rule {
 		return 0
 	}
 	paramDiff := nextDelta.Info.Param - delta.Info.Param

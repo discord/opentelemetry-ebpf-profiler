@@ -25,6 +25,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
+	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
@@ -36,6 +37,40 @@ func (nopEbpf) UpdateProcData(libpf.InterpreterType, libpf.PID, unsafe.Pointer) 
 
 type traceCapture struct {
 	traces []*libpf.Trace
+}
+
+func TestUnwindErrorFramesHaveDistinctNames(t *testing.T) {
+	capture := &traceCapture{}
+	pm := &ProcessManager{traceReporter: capture}
+	for _, code := range []uint64{5, 7002, 7006, 9999} {
+		pm.HandleTrace(&libpf.EbpfTrace{
+			NumFrames: 1,
+			FrameData: libpf.NewEbpfFrame(libpf.UnknownFrame,
+				libpf.FrameFlags(support.FrameFlagError), 1, code),
+		}, nil)
+	}
+	require.Len(t, capture.traces, 4)
+	names := make(map[string]bool)
+	for i, trace := range capture.traces {
+		require.Len(t, trace.Frames, 1)
+		frame := trace.Frames[0].Value()
+		assert.True(t, frame.Type.IsAbort())
+		assert.Equal(t, []uint64{5, 7002, 7006, 9999}[i], uint64(frame.AddressOrLineno))
+		name := frame.FunctionName.String()
+		assert.Contains(t, name, "unwind error")
+		assert.False(t, names[name], "error frames must have distinct names")
+		names[name] = true
+	}
+	assert.Contains(t, capture.traces[1].Frames[0].Value().FunctionName.String(), "stack frame scan iteration limit")
+	assert.Contains(t, capture.traces[2].Frames[0].Value().FunctionName.String(), "current code header")
+
+	pm.filterErrorFrames = true
+	pm.HandleTrace(&libpf.EbpfTrace{
+		NumFrames: 1,
+		FrameData: libpf.NewEbpfFrame(libpf.UnknownFrame,
+			libpf.FrameFlags(support.FrameFlagError), 1, 7002),
+	}, nil)
+	assert.Empty(t, capture.traces[4].Frames)
 }
 
 func (tc *traceCapture) ReportTraceEvent(trace *libpf.Trace, _ *samples.TraceEventMeta) error {
