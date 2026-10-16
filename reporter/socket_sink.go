@@ -3,42 +3,9 @@
 
 package reporter // import "go.opentelemetry.io/ebpf-profiler/reporter"
 
-// Discord addition: one of the local egress's two independent backends
-// (local_egress.go). It streams the SAME assembled samples the pprof backend
-// would buffer over a unix socket, so a consumer can bucket them at
-// sub-iteration resolution. It runs with the pprof backend, without it, or
-// alongside it: nothing here reaches into the other sink.
-//
-// Why it is not its own Reporter with its own decode: the local egress's
-// assembler has already resolved everything that matters (frames flattened out
-// of the interned tables, lineage read while the process still exists,
-// comm/container/pid/tid/ktime) into ONE sampleEvent, and this sink emits from
-// that exact value. That is what makes the socket path and the pprof path
-// structurally identical rather than merely intended to agree: there is no
-// second decode to drift.
-//
-// Three properties are load-bearing and are the reason this is not simply
-// "write the struct to a socket":
-//
-//   - NEVER BLOCK THE AGENT. A slow or absent consumer must cost samples, not
-//     latency, because the alternative is the profiler stalling the box it is
-//     measuring. offer() is a non-blocking channel send; everything past the
-//     channel runs on one writer goroutine.
-//   - A SILENTLY LOSSY PROFILER IS WORSE THAN A DEAD ONE. Every drop is
-//     counted, the count rides on the wire next to the gap it describes
-//     (SAMPLE.dropped_since_prev), and the absolute totals are re-stated
-//     periodically (STATS). When the pprof backend is ALSO enabled the totals
-//     are additionally written into that archive's comments, so the two
-//     artifacts cross-attest; in a socket-only run the wire and the loss
-//     warning are the whole story, because there is no archive to attest to.
-//   - SELF-DESCRIBING. The stream announces its version, its framing width,
-//     its frame ordering and its frame cap up front, every record is
-//     length-prefixed so an unknown type is skippable, and both kinds of
-//     truncation (samples dropped, frame list capped) have an explicit field.
-//
-// The full wire format is specified in doc/discord-fork.md, section "Socket
-// egress wire format". The constants below are the normative definition; keep
-// the two in step.
+// Socket output for assembled local samples. A bounded queue isolates the
+// reporting path from socket I/O; losses are counted in STATS and profile
+// comments when both backends are active. See doc/discord-fork.md for wire v2.
 
 import (
 	"bufio"
@@ -54,7 +21,6 @@ import (
 	"golang.org/x/sys/unix"
 
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
-	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
 
@@ -172,36 +138,11 @@ const (
 	socketDialBackoffMax = 5 * time.Second
 	socketWriteBufBytes  = 1 << 20
 
-	// A consumer that connects and then stops reading WITHOUT closing fills
-	// the socket buffers, and an unbounded write then blocks the writer
-	// goroutine forever: it never reaches its stop channel, so shutdown never
-	// completes and the agent has to be SIGKILLed. Every write is therefore
-	// deadlined, by SocketConfig.WriteTimeout, clamped here so neither a
-	// microsecond setting nor an hour-long one produces a nonsense deadline.
-	// Exceeding it is not special: it takes the same connFailed path as any
-	// other write error, because a consumer that cannot keep up is exactly a
-	// consumer that is gone.
-	//
-	// The deadline used to be derived from FlushInterval (20x, same clamp).
-	// That derivation died with per-sample flushing: a record no longer waits
-	// for a flush period, so "several flush periods" stopped describing
-	// anything. The bound is a property of the CONSUMER (how long a healthy one
-	// may take to accept one record), so it gets its own knob.
+	// Bound writes so a stalled consumer cannot keep the writer alive forever.
 	socketWriteDeadlineMin = 250 * time.Millisecond
 	socketWriteDeadlineMax = 5 * time.Second
 
-	// socketShutdownSlack is how much longer than ONE write deadline shutdown()
-	// waits before abandoning the writer. The shutdown budget is DERIVED from
-	// the write deadline (see socketSink.shutdownTimeout) rather than being an
-	// independent constant, because the two are not independent: the deadline
-	// is what unwedges a stuck writer, and the backstop is only a backstop if
-	// it fires after the deadline has had its chance. A fixed 2s backstop under
-	// a configurable deadline whose max is 5s meant a -socket-egress-write-
-	// timeout of 3s inverted them: every wedged-consumer shutdown hit the
-	// backstop first, so the final STATS record was never written and the loss
-	// was reported through the explicitly-approximate residual path instead of
-	// exactly. Deriving makes "deadline first, backstop second" structural
-	// instead of a coincidence of two numbers.
+	// socketShutdownSlack gives a timed-out write time to finish its cleanup.
 	socketShutdownSlack = time.Second
 )
 
@@ -222,14 +163,8 @@ type SocketConfig struct {
 	// StatsInterval is how often a STATS record is emitted. Also emitted
 	// immediately after the header and immediately before a clean close.
 	StatsInterval time.Duration
-	// FlushInterval is a SAFETY NET, not the latency floor. Every sample is
-	// flushed as it is written (see run), so in normal operation the ticker it
-	// drives finds an empty buffer and does nothing. It is kept because
-	// "nothing may sit in the write buffer indefinitely" is a property worth
-	// holding unconditionally: a future record type that forgets its flush
-	// would otherwise strand bytes until the next sample, and a stream with a
-	// low sample rate can make that a long time. The flag it backs also stays
-	// valid for anyone who already passes it.
+	// FlushInterval bounds buffered-record latency. Samples are also flushed
+	// individually; this ticker usually finds an empty buffer.
 	FlushInterval time.Duration
 	// WriteTimeout bounds ONE record write (or flush) before the connection is
 	// declared dead. It is the socket path's answer to "how long may a healthy
@@ -242,25 +177,10 @@ type SocketConfig struct {
 	SamplesPerSecond int
 }
 
-// socketStats is the counter set, mirrored onto the wire by RecStats.
-//
-// produced == emitted + droppedRing + droppedNoSock + droppedWrite holds at any
-// quiescent point, and a consumer is expected to assert it. droppedWrite has no
-// slot in the v1 STATS payload and adding one would be a wire change, so a
-// consumer recovers it as the residual:
-//
-//	droppedWrite = produced - emitted - droppedRing - droppedNoSock
-//
-// which is exactly the gap the pre-fix code left unexplained. It is included in
-// Dropped(), so the in-process guards (SocketDropped(), the fixture's
-// require.Zero, and -- only when the pprof backend is also enabled -- the pprof
-// file's comment) see it even though the wire cannot name it.
-//
-// The counters are read one at a time, not under a fence: the STATS record
-// written just before a clean close is a snapshot, not a barrier against a
-// concurrent offer(), so a sample offered during shutdown can be in produced
-// and in nothing else. A consumer treats the identity above as exact only for a
-// quiesced producer, and the residual as an upper bound otherwise.
+// socketStats mirrors the wire counters. At quiescence:
+// produced = emitted + droppedRing + droppedNoSock + droppedWrite.
+// STATS has no droppedWrite field; consumers infer it as the residual.
+// Concurrent snapshots may also include queued or in-flight samples.
 type socketStats struct {
 	produced      atomic.Uint64
 	emitted       atomic.Uint64
@@ -286,22 +206,15 @@ type socketSink struct {
 	// lastSeenDrops is the cumulative drop total the writer has already
 	// attributed to a SAMPLE record. Read and written only by the writer
 	// goroutine.
-	lastSeenDrops uint64
+	lastSeenDrops    uint64
+	lastEmittedDrops uint64
 	// lastLoggedDrops is the drop total the last warning stated. Warning on
 	// the cumulative total instead of on its growth makes one lost sample
 	// produce a warning every stats interval for the life of the process,
 	// which trains the reader to ignore the one line that matters.
 	lastLoggedDrops uint64
-	// pendingSamples is the number of SAMPLE records written into bw but not
-	// yet flushed. They are not emitted yet -- a record in the write buffer has
-	// not reached the consumer -- and they are lost if the connection dies
-	// first. Writer goroutine only.
-	//
-	// run() flushes after every sample, so on that path this is only ever 0 or
-	// 1. It stays a COUNT rather than a flag because writeSample does not
-	// require a flush after it: drainAndClose writes the whole ring and then
-	// flushes once, and a caller can too. The exactness of `emitted` must not
-	// depend on who calls flush() how often.
+	// pendingSamples counts serialized samples awaiting a successful flush.
+	// Only the writer goroutine accesses it.
 	pendingSamples uint64
 
 	// String table, per connection. Reset on reconnect.
@@ -322,9 +235,10 @@ type socketSink struct {
 	lrefs []lref
 	lkeys []string
 
-	stopOnce sync.Once
-	stop     chan struct{}
-	done     chan struct{}
+	startOnce sync.Once
+	stopOnce  sync.Once
+	stop      chan struct{}
+	done      chan struct{}
 }
 
 func newSocketSink(cfg SocketConfig) (*socketSink, error) {
@@ -364,13 +278,7 @@ func newSocketSink(cfg SocketConfig) (*socketSink, error) {
 	}, nil
 }
 
-// offer hands one sample to the sink. It never blocks and never errors: a full
-// ring means a slow consumer, and the only correct response is to drop the
-// sample and say so.
-//
-// ev must not be mutated after this call. When the pprof backend is also
-// enabled it is the SAME value that backend buffers -- both paths seeing
-// byte-identical input is the whole point -- and neither side writes to it.
+// offer queues an immutable event without waiting for socket I/O.
 func (s *socketSink) offer(ev *sampleEvent) {
 	s.st.produced.Add(1)
 	select {
@@ -398,15 +306,7 @@ func (s *socketSink) dropSummary() string {
 		s.st.droppedWrite.Load(), s.st.emitted.Load(), s.st.produced.Load())
 }
 
-// dropSummaryIfLossy renders the loss summary, or "" when this run lost
-// nothing. It is what the pprof backend's cross-attestation hook calls, so the
-// archive carries the stream's loss when there is some to carry and stays quiet
-// otherwise -- without either sink knowing the other's type.
-// A nil receiver is "no socket backend, so no loss to report": the pprof sink
-// holds this as a bare func value and calls it from build(), where a nil check
-// on the func cannot see that its receiver is nil. Guarding here means the
-// construction-time "only wire crossAttest when both backends exist" rule is a
-// policy rather than the only thing standing between build() and a panic.
+// dropSummaryIfLossy supplies a loss comment when the socket discarded samples.
 func (s *socketSink) dropSummaryIfLossy() string {
 	if s == nil || s.Dropped() == 0 {
 		return ""
@@ -415,27 +315,18 @@ func (s *socketSink) dropSummaryIfLossy() string {
 }
 
 func (s *socketSink) start() {
-	go s.run()
+	s.startOnce.Do(func() { go s.run() })
 }
 
 func (s *socketSink) shutdown() {
+	s.start()
 	budget := s.shutdownTimeout()
 	s.stopOnce.Do(func() { close(s.stop) })
 	select {
 	case <-s.done:
 	case <-time.After(budget):
-		// The writer is wedged somewhere the write deadline did not reach.
-		// Abandoning it costs a goroutine and the final STATS record; waiting
-		// costs the whole process, which is the profiler refusing to die on
-		// SIGINT. Say so rather than exiting quietly.
-		//
-		// Abandoning it also abandons everything it held: up to RingSize
-		// samples still in s.ring and up to socketWriteBufBytes worth in the
-		// write buffer, all charged to produced and to nothing else. Left
-		// there, Dropped() reports 0 for a run that lost tens of thousands of
-		// samples -- and Dropped() is what the equivalence fixture's
-		// require.Zero trusts when it certifies a capture as comparable. So
-		// charge the whole unaccounted residual to write loss.
+		// Account for the unreported residual if the writer exceeds its shutdown
+		// budget. This snapshot is approximate while the writer is still running.
 		residual := s.residualUnaccounted()
 		s.st.droppedWrite.Add(residual)
 		log.Warnf("socket egress: writer did not finish within %s; abandoning it "+
@@ -444,23 +335,12 @@ func (s *socketSink) shutdown() {
 	}
 }
 
-// shutdownTimeout is how long shutdown() waits for the writer goroutine. It is
-// one write deadline plus socketShutdownSlack, so it is strictly greater than
-// writeDeadline() for every configured WriteTimeout: a wedged write is given
-// its full deadline (which tears the connection down, writes the final STATS
-// and accounts the loss exactly) before this backstop abandons the writer and
-// falls back to the approximate residual. Pinned by
-// TestSocketShutdownBudgetAlwaysExceedsWriteDeadline.
+// shutdownTimeout allows a write deadline and its cleanup before the backstop.
 func (s *socketSink) shutdownTimeout() time.Duration {
 	return s.writeDeadline() + socketShutdownSlack
 }
 
-// residualUnaccounted is the number of samples produced that no other counter
-// explains. It is APPROXIMATE by construction: the abandoned writer goroutine
-// may still be mutating these counters while they are read one at a time, so
-// the residual can be off by however many samples that goroutine moves between
-// the loads. Approximate is fine; zero is not, because zero is indistinguishable
-// from a lossless run.
+// residualUnaccounted estimates pending samples from non-atomic snapshots.
 func (s *socketSink) residualUnaccounted() uint64 {
 	accounted := s.st.emitted.Load() + s.st.droppedRing.Load() +
 		s.st.droppedNoSock.Load() + s.st.droppedWrite.Load()
@@ -497,29 +377,12 @@ func (s *socketSink) armWriteDeadline() {
 	}
 }
 
-// flush pushes the write buffer at the socket and promotes what it carried from
-// "written" to "emitted". Counting a sample as emitted when it was handed to
-// the buffer instead is what let a consumer restart silently discard up to a
-// megabyte of samples that STATS had already claimed were delivered.
-//
-// pendingSamples is exact rather than an estimate: every record goes out
-// through writeBuffered, which flushes explicitly when the record would not
-// fit, so bufio never auto-flushes behind this counter's back. Were it allowed
-// to, records that DID reach the consumer would be charged to droppedWrite and
-// never counted as emitted. run() now flushes per sample, so the buffer rarely
-// fills there -- but writeSample is still callable without a flush after it
-// (drainAndClose does exactly that with the whole ring), so the exactness
-// cannot rest on the flush cadence.
+// flush counts buffered samples as emitted only after a successful write.
 func (s *socketSink) flush() error {
 	if s.bw == nil {
 		return nil
 	}
-	// Nothing buffered and nothing pending: no write, and no deadline syscall
-	// either. That is the normal state of the safety-net ticker now that every
-	// sample is flushed as it is written. Both conditions are checked because a
-	// record too large for an EMPTY buffer would bypass bufio (Buffered() == 0
-	// while pendingSamples counts it); the static assertion below rules that
-	// out for SAMPLE records, and this keeps the promotion correct regardless.
+	// Skip the deadline syscall when there is nothing to flush.
 	if s.bw.Buffered() == 0 && s.pendingSamples == 0 {
 		return nil
 	}
@@ -529,20 +392,14 @@ func (s *socketSink) flush() error {
 	}
 	if s.pendingSamples > 0 {
 		s.st.emitted.Add(s.pendingSamples)
+		s.lastEmittedDrops = s.lastSeenDrops
 		s.pendingSamples = 0
 	}
 	return nil
 }
 
-// writeBuffered appends one serialized record to the write buffer, flushing
-// first when it would not fit.
-//
-// The explicit flush is what keeps pendingSamples exact. bufio.Writer flushes
-// on its own when an append does not fit, and that flush is invisible here:
-// the bytes reach the consumer while pendingSamples still claims they are
-// buffered, so a connection that then dies charges delivered samples to
-// droppedWrite and never counts them as emitted. Flushing here instead means
-// every promotion goes through flush().
+// writeBuffered flushes explicitly before a record would fill the buffer,
+// so bufio cannot flush samples without updating pendingSamples.
 func (s *socketSink) writeBuffered(rec []byte) error {
 	if s.bw.Available() < len(rec) {
 		if err := s.flush(); err != nil {
@@ -553,17 +410,7 @@ func (s *socketSink) writeBuffered(rec []byte) error {
 	return err
 }
 
-// One SAMPLE record can never be larger than the write buffer, which is what
-// makes the flush above sufficient: bufio bypasses its buffer entirely for a
-// record that does not fit in an EMPTY buffer, and such a record would reach
-// the wire immediately, leaving pendingSamples over-counting by one. A negative
-// array length here is a compile error, so shrinking the buffer or widening
-// n_frames past a u16 cannot silently reintroduce that case.
-//
-// Per-sample flushing did not retire this. The buffer still exists to batch one
-// sample's STRDEF records and its SAMPLE record into ONE write syscall, and the
-// bypass it rules out is exactly what would make flush()'s empty-buffer
-// fast-path skip a promotion.
+// The frame-only maximum fits the buffer; writeSample also checks labels.
 var _ [socketWriteBufBytes - (5 + socketSampleFixedLen + 0xffff*socketFrameLen)]struct{}
 
 // ktimeNs reads CLOCK_MONOTONIC, the clock the samples are stamped in. The
@@ -596,14 +443,7 @@ func (s *socketSink) run() {
 		case <-s.stop:
 			s.drainAndClose()
 			return
-		// TODO(perf): this arm is a Go channel hand-off plus one write syscall
-		// per sample. A shared-memory ring buffer between the sampling path and
-		// the consumer would remove both -- no per-sample syscall, no Go
-		// channel send -- and could raise sustainable throughput
-		// substantially. Deliberately left alone for now: the channel is what
-		// makes "the agent never blocks on a slow consumer" true and cheap to
-		// reason about, and the wire format is frozen. Not designed, not
-		// sketched, not started.
+
 		case ev := <-s.ring:
 			if s.conn == nil {
 				if time.Now().Before(nextDial) {
@@ -661,14 +501,8 @@ func (s *socketSink) run() {
 // closes. A consumer therefore sees the authoritative totals for the run
 // immediately before EOF.
 func (s *socketSink) drainAndClose() {
-	// The sink dials lazily, on the first sample to reach run(). When stop and
-	// a queued sample are both ready, run()'s select picks between them at
-	// random, so shutdown can arrive here with samples in the ring and no
-	// connection ever attempted. Dropping those meant a short run -- or any run
-	// whose first samples coincided with shutdown -- silently delivered
-	// nothing. One dial attempt, not the backoff loop: if the consumer is not
-	// there, the drops below are the honest answer, and shutdown must stay
-	// bounded.
+	// Try one connection during shutdown if the first queued sample has not
+	// reached the lazy dial yet.
 	dialed := false
 	for {
 		select {
@@ -686,15 +520,7 @@ func (s *socketSink) drainAndClose() {
 			}
 		default:
 			if s.conn != nil {
-				// Same ordering as the stats tick, and it matters more here:
-				// this is the record a consumer treats as authoritative for
-				// the run, so the drained samples must be counted as emitted
-				// before it is built.
-				// Same error handling as the stats tick, too: a final STATS
-				// that failed to write is a connection that died during
-				// shutdown, and swallowing it hid both the warning and the
-				// connectErrors increment a consumer uses to tell "the
-				// producer stopped" from "my link broke".
+				// Flush samples before writing their final counters.
 				if err := s.flush(); err != nil {
 					s.connFailed(err)
 				} else if err := s.writeStats(); err != nil {
@@ -737,7 +563,7 @@ func (s *socketSink) lossWarning() (string, bool) {
 }
 
 func (s *socketSink) dial() error {
-	c, err := net.Dial("unix", s.cfg.Path)
+	c, err := net.DialTimeout("unix", s.cfg.Path, s.writeDeadline())
 	if err != nil {
 		s.st.connectErrors.Add(1)
 		return err
@@ -812,6 +638,7 @@ func (s *socketSink) connFailed(err error) {
 		_ = s.conn.Close()
 	}
 	s.conn, s.bw = nil, nil
+	s.lastSeenDrops = s.lastEmittedDrops
 	// The buffer dies with the connection, so every already-serialized sample
 	// still in it is gone here. That is the loss the old accounting reported as
 	// "emitted".
@@ -899,7 +726,7 @@ func (s *socketSink) writeSample(ev *sampleEvent) error {
 	}
 
 	s.frefs = s.frefs[:0]
-	for i := 0; i < nFrames; i++ {
+	for i := range nFrames {
 		fn, err := s.str(ev.frames[i].function)
 		if err != nil {
 			return err
@@ -911,14 +738,8 @@ func (s *socketSink) writeSample(ev *sampleEvent) error {
 		s.frefs = append(s.frefs, fref{fn, fl})
 	}
 
-	// Labels, resolved in sorted key order. The order is deliberate, not
-	// incidental: ev.labels is a map, so serializing in range order would make
-	// two byte-identical captures produce different streams, which breaks the
-	// equivalence fixture and any downstream diff that hashes a record.
-	//
-	// Contract keys are skipped exactly as the pprof path skips them: a traced
-	// process must not be able to overwrite the reporter's own comm or origin
-	// by emitting a custom label of that name.
+	// Resolve labels in sorted key order for deterministic records. Match
+	// the pprof backend's reserved-key and numeric-label rules.
 	if err := s.resolveLabels(ev); err != nil {
 		return err
 	}
@@ -926,7 +747,7 @@ func (s *socketSink) writeSample(ev *sampleEvent) error {
 	// The drop delta is read at serialization time, so it attributes losses to
 	// the gap they most plausibly belong to. The TOTAL is exact (STATS); the
 	// per-record attribution is exact to within one writer iteration.
-	cum := s.st.droppedRing.Load() + s.st.droppedNoSock.Load()
+	cum := s.Dropped()
 	delta := cum - s.lastSeenDrops
 	s.lastSeenDrops = cum
 	if delta > 0xffffffff {
@@ -967,7 +788,7 @@ func (s *socketSink) writeSample(ev *sampleEvent) error {
 	binary.LittleEndian.PutUint64(fixed[72:80], ev.erlangPidKey)
 	s.scratch = append(s.scratch, fixed[:]...)
 
-	for i := 0; i < nFrames; i++ {
+	for i := range nFrames {
 		s.scratch = binary.LittleEndian.AppendUint32(s.scratch, s.frefs[i].fn)
 		s.scratch = binary.LittleEndian.AppendUint32(s.scratch, s.frefs[i].file)
 		s.scratch = binary.LittleEndian.AppendUint32(s.scratch, uint32(ev.frames[i].line))
@@ -1003,11 +824,16 @@ func (s *socketSink) resolveLabels(ev *sampleEvent) error {
 		return nil
 	}
 	s.lkeys = s.lkeys[:0]
-	for k := range ev.labels {
-		if _, reserved := contractLabelKeys[k]; reserved {
+	for k, v := range ev.labels {
+		if _, reserved := contractLabelKeys[k]; reserved || v == "" {
 			continue
 		}
 		s.lkeys = append(s.lkeys, k)
+	}
+	nFrames := min(len(ev.frames), s.cfg.MaxFrames)
+	maxLabels := min(0xffff, (socketWriteBufBytes-5-socketSampleFixedLen-nFrames*socketFrameLen)/socketLabelLen)
+	if len(s.lkeys) > maxLabels {
+		return fmt.Errorf("socket sample has %d labels; maximum for %d frames is %d", len(s.lkeys), nFrames, maxLabels)
 	}
 	sort.Strings(s.lkeys)
 
@@ -1065,14 +891,7 @@ func (s *socketSink) writeStats() error {
 	return s.writeBuffered(s.scratch)
 }
 
-// socketOrigin maps an origin to its wire byte. The mapping lives in
-// originTable (local_egress.go) together with the origin's validity and
-// its pprof label name, so a new origin cannot be added to two of the three and
-// forgotten in the third.
-// socketValueKind maps the reporter's value kind onto the wire's own
-// numbering. The two happen to agree today; mapping explicitly means an
-// upstream renumbering shows up as a compile error or an Unknown, never as a
-// capture whose alloc words are silently relabelled as scheduler nanoseconds.
+// socketValueKind maps measurement kinds to their fixed wire codes.
 func socketValueKind(k uint8) uint8 {
 	switch k {
 	case samples.ValueKindAlloc:
@@ -1094,7 +913,7 @@ type lref struct {
 	num            int64
 }
 
-func socketOrigin(o libpf.Origin) uint8 {
+func socketOrigin(o sampleOrigin) uint8 {
 	if info, ok := originTable[o]; ok {
 		return info.wire
 	}

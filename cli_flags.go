@@ -6,13 +6,17 @@ package main
 import (
 	"flag"
 	"fmt"
+	"math"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/peterbourgon/ff/v3"
 
+	"go.opentelemetry.io/ebpf-profiler/collector"
 	"go.opentelemetry.io/ebpf-profiler/collector/config"
 	"go.opentelemetry.io/ebpf-profiler/internal/controller"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/interpreterconfig"
 	"go.opentelemetry.io/ebpf-profiler/tracer"
 )
 
@@ -82,11 +86,21 @@ var (
 		"various user or kernel space hooks."
 )
 
-// Package-scope variable, so that conditionally compiled other components can refer
-// to the same flagset.
+type cliConfig struct {
+	controller.Config
+	Copyright       bool
+	Version         bool
+	PprofAddr       string
+	Tracers         string
+	CollAgentAddr   string
+	DisableTLS      bool
+	OffCPUThreshold float64
+	ProbeLinks      []string
+	LoadProbe       bool
+}
 
-func parseArgs() (*controller.Config, error) {
-	var args controller.Config
+func parseArgs() (*cliConfig, error) {
+	args := cliConfig{Config: controller.Config{Config: *collector.NewFactory().CreateDefaultConfig().(*config.Config)}}
 
 	fs := flag.NewFlagSet("ebpf-profiler", flag.ExitOnError)
 
@@ -94,6 +108,7 @@ func parseArgs() (*controller.Config, error) {
 	fs.UintVar(&args.BPFVerifierLogLevel, "bpf-log-level", 0, bpfVerifierLogLevelHelp)
 
 	fs.StringVar(&args.CollAgentAddr, "collection-agent", "", collAgentAddrHelp)
+	fs.String("config", "", "Read command-line options from this file.")
 	fs.BoolVar(&args.Copyright, "copyright", false, copyrightHelp)
 
 	fs.BoolVar(&args.DisableTLS, "disable-tls", false, disableTLSHelp)
@@ -159,9 +174,7 @@ func parseArgs() (*controller.Config, error) {
 		fs.PrintDefaults()
 	}
 
-	args.Fs = fs
-
-	return &args, ff.Parse(fs, os.Args[1:],
+	err := ff.Parse(fs, os.Args[1:],
 		ff.WithEnvVarPrefix("OTEL_PROFILING_AGENT"),
 		ff.WithConfigFileFlag("config"),
 		ff.WithConfigFileParser(ff.PlainParser),
@@ -170,4 +183,51 @@ func parseArgs() (*controller.Config, error) {
 		ff.WithIgnoreUndefined(true),
 		ff.WithAllowMissingConfigFile(true),
 	)
+	if err != nil {
+		return nil, err
+	}
+	args.Interpreters, err = parseInterpreters(args.Tracers)
+	if err != nil {
+		return nil, err
+	}
+	if math.IsNaN(args.OffCPUThreshold) || args.OffCPUThreshold < 0 || args.OffCPUThreshold > 1 {
+		return nil, fmt.Errorf("off-cpu-threshold must be between 0 and 1")
+	}
+	return &args, nil
+}
+
+func parseInterpreters(value string) (interpreterconfig.Config, error) {
+	cfg := interpreterconfig.NoInterpreters()
+	for name := range strings.SplitSeq(value, ",") {
+		switch strings.ToLower(strings.TrimSpace(name)) {
+		case "all":
+			cfg = interpreterconfig.AllInterpreters()
+		case "", "native":
+		case "perl":
+			cfg.Perl.Disabled = false
+		case "php":
+			cfg.PHP.Disabled = false
+		case "python":
+			cfg.Python.Disabled = false
+		case "hotspot":
+			cfg.Hotspot.Disabled = false
+		case "ruby":
+			cfg.Ruby.Disabled = false
+		case "v8":
+			cfg.V8.Disabled = false
+		case "dotnet":
+			cfg.Dotnet.Disabled = false
+		case "go", "labels":
+			cfg.Go.Disabled = false
+		case "beam":
+			cfg.BEAM.Disabled = false
+		case "luajit":
+			cfg.LuaJIT.Disabled = false
+		case "thread_context":
+			cfg.ThreadContext.Disabled = false
+		default:
+			return cfg, fmt.Errorf("unknown tracer: %s", name)
+		}
+	}
+	return cfg, nil
 }

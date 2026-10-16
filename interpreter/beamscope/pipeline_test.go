@@ -3,12 +3,6 @@
 
 package beamscope
 
-// Whole-pipeline tests: a fixture segment is drained through a real drainer
-// into (a) an in-memory reporter mock and (b) the JSONL sidecar, and further
-// through the fork's local-egress reporter to validate the pprof-side contract
-// (origin name, value channel, custom labels). No live BEAM, no mmap: the
-// drainer runs against an in-memory segment via the test constructor below.
-
 import (
 	"bytes"
 	"encoding/json"
@@ -22,7 +16,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
 // testPID is the OS pid the pipeline tests attach as. It matches the fixture
@@ -119,7 +112,7 @@ func readJSONL(t *testing.T, s *jsonlSink) []map[string]any {
 		return nil
 	}
 	var out []map[string]any
-	for _, line := range bytes.Split(data, []byte("\n")) {
+	for line := range bytes.SplitSeq(data, []byte("\n")) {
 		var obj map[string]any
 		if err := json.Unmarshal(line, &obj); err != nil {
 			t.Fatalf("bad JSONL line %q: %v", line, err)
@@ -191,18 +184,14 @@ func TestPipelineToMockReporterAndJSONL(t *testing.T) {
 			t.Errorf("trace %d frame name %q, want %q", i, got, wantNames[i])
 		}
 		meta := mock.metas[i]
-		if meta.Origin != support.TraceOriginBeamScope {
-			t.Errorf("trace %d origin %v, want TraceOriginBeamScope", i, meta.Origin)
+		if samples.BeamScopeValueKind(meta.ProfileType) == samples.ValueKindNone {
+			t.Errorf("trace %d origin %v, want TraceOriginBeamScope", i, meta.ProfileType)
 		}
 		if meta.Value != wantAlloc[i] {
 			t.Errorf("trace %d value %d, want %d", i, meta.Value, wantAlloc[i])
 		}
-		if meta.ValueKind != samples.ValueKindAlloc {
-			t.Errorf("trace %d ValueKind %d, want ValueKindAlloc", i, meta.ValueKind)
-		}
-		if meta.OffTime != 0 {
-			t.Errorf("trace %d OffTime %d, want 0 (retired as a beamscope value channel)",
-				i, meta.OffTime)
+		if samples.BeamScopeValueKind(meta.ProfileType) != samples.ValueKindAlloc {
+			t.Errorf("trace %d ValueKind %d, want ValueKindAlloc", i, samples.BeamScopeValueKind(meta.ProfileType))
 		}
 		if meta.KTime != int64(tK+uint64(10*(i+1))) {
 			t.Errorf("trace %d KTime %d, want %d", i, meta.KTime, tK+uint64(10*(i+1)))
@@ -226,7 +215,7 @@ func TestPipelineToMockReporterAndJSONL(t *testing.T) {
 		}
 	}
 	// Distinct stacks must not share a trace hash.
-	if mock.traces[0].Hash == mock.traces[1].Hash {
+	if mock.traces[0].Hash() == mock.traces[1].Hash() {
 		t.Error("distinct stacks share a trace hash")
 	}
 
@@ -294,10 +283,6 @@ func TestPipelineToMockReporterAndJSONL(t *testing.T) {
 	d.shutdown()
 }
 
-// TestDrainStatsJSONLEmission pins the drop-observability contract: the first
-// drain after attach emits a reader-synthesized drain_stats line carrying the
-// writer's counters as it found them (the pre-attach drops), further lines
-// appear only when the counters change, and per-ring totals are included.
 func TestDrainStatsJSONLEmission(t *testing.T) {
 	f := newFixture(t, 2, 4096)
 	// Pre-attach: the writer dropped 7 records on ring 0 before any reader
@@ -490,12 +475,8 @@ func TestPipelineV2Types(t *testing.T) {
 		if wt.kind == "sched" {
 			wantKind = samples.ValueKindSchedNS
 		}
-		if meta.ValueKind != wantKind {
-			t.Errorf("trace %d ValueKind %d, want %d", i, meta.ValueKind, wantKind)
-		}
-		if meta.OffTime != 0 {
-			t.Errorf("trace %d OffTime %d, want 0 (retired as a beamscope value channel)",
-				i, meta.OffTime)
+		if samples.BeamScopeValueKind(meta.ProfileType) != wantKind {
+			t.Errorf("trace %d ValueKind %d, want %d", i, samples.BeamScopeValueKind(meta.ProfileType), wantKind)
 		}
 	}
 	// GC_DELTA2 extras.
@@ -523,7 +504,7 @@ func TestPipelineV2Types(t *testing.T) {
 		t.Error("unclassified sched sample carries yields")
 	}
 	// Distinct kinds on the same process must not share a trace hash.
-	if mock.traces[1].Hash == mock.traces[2].Hash {
+	if mock.traces[1].Hash() == mock.traces[2].Hash() {
 		t.Error("alloc and sched samples share a trace hash")
 	}
 
@@ -556,9 +537,6 @@ func TestPipelineV2Types(t *testing.T) {
 	d.shutdown()
 }
 
-// TestPipelineV2ThroughPprofFileReporter validates the v2 pprof contract:
-// beamscope_kind separates the populations, sched samples carry on_sched_ns
-// in the value slot, and the numeric extras are num labels with units.
 func TestPipelineV2ThroughPprofFileReporter(t *testing.T) {
 	f := newFixture(t, 2, 4096)
 	fillV2Types(t, f)
@@ -646,11 +624,6 @@ func fillScopeTypes(t *testing.T, f *fixture) {
 	f.mustWrite(t, 1, encMsgFlow(tK+2, tU+2, 0x3003, 555))
 }
 
-// TestPipelineScopeTypes: SCOPE_CONFIG/VM_STAT never reach the reporter (they
-// carry no pid_key stack to synthesize) and go to JSONL with their ABI-named
-// snake_case fields intact. MSG_FLOW is different: it always reaches
-// JSONL too, but ALSO settles into one pprof-bound sample, scaled by the
-// SCOPE_CONFIG's recv_sample_shift.
 func TestPipelineScopeTypes(t *testing.T) {
 	f := newFixture(t, 2, 4096)
 	fillScopeTypes(t, f)
@@ -719,14 +692,12 @@ func TestPipelineScopeTypes(t *testing.T) {
 		t.Errorf("settled msg_flow beamscope_kind %q, want msg", got)
 	}
 	m := mock.metas[0]
-	if m.ValueKind != samples.ValueKindMsgs || m.Value != int64(555<<6) {
+	if samples.BeamScopeValueKind(m.ProfileType) != samples.ValueKindMsgs || m.Value != int64(555<<6) {
 		t.Errorf("settled msg_flow value=%d kind=%d, want %d/ValueKindMsgs",
-			m.Value, m.ValueKind, int64(555<<6))
+			m.Value, samples.BeamScopeValueKind(m.ProfileType), int64(555<<6))
 	}
 }
 
-// TestRecordedFixtureV2 decodes the writer peer's v2 recorded segment
-// (GC_DELTA2/SCHED_UTIL/SCHED_DELTA era) once it lands; skips until then.
 func TestRecordedFixtureV2(t *testing.T) {
 	seg := loadRecordedSegment(t, "BEAMSCOPE_FIXTURE_V2", "shm_v2.bin")
 	recs, st := collect(seg)
@@ -796,11 +767,6 @@ func TestRecordedFixtureV2(t *testing.T) {
 		len(recs), byType, st.Padding, st.Dropped)
 }
 
-// TestRecordedFixture decodes a segment recorded from a real BEAM by the
-// beam_scope shmdump tool. The fixture is checked in under testdata/;
-// override with BEAMSCOPE_FIXTURE. Note that v1 predates record types
-// 0x0B-0x10 entirely -- TestRecordedFixtureV5 is what covers those against
-// producer-generated bytes.
 func TestRecordedFixture(t *testing.T) {
 	seg := loadRecordedSegment(t, "BEAMSCOPE_FIXTURE", "shm_v1.bin")
 	recs, st := collect(seg)
@@ -833,13 +799,6 @@ func TestRecordedFixture(t *testing.T) {
 		len(recs), byType, st.Padding, st.Unknown, st.Dropped)
 }
 
-// TestGCDelta2NoStartSuppressesUnmeasuredLabels is the sink half of the
-// NO_START fix. The writer zero-fills pause_ns and mbuf_words when it never
-// saw the matching gc_start, so emitting them as num labels would put a
-// fabricated "0 ns pause, 0 mbuf words" sample into the profile -- and a 0 ns
-// pause is not merely missing, it drags every GC-pause average down while
-// looking exactly like a genuinely fast GC. alloc_words (the sample value)
-// and bin_vheap_delta ARE measured on a NO_START record and must survive.
 func TestGCDelta2NoStartSuppressesUnmeasuredLabels(t *testing.T) {
 	f := newFixture(t, 1, 4096)
 	f.mustWrite(t, 0, encProcMeta(tK, tU, 0x2001, 555, 1,
@@ -885,14 +844,6 @@ func TestGCDelta2NoStartSuppressesUnmeasuredLabels(t *testing.T) {
 	}
 }
 
-// TestTornDownScopeConfigNeverScales is the SCOPE_CONFIG bit0 fix. A config
-// with bit0 CLEAR is a torn-down segment, not the live config -- the producer
-// ABI says a reader keeps the last bit0-SET record, and the downstream
-// consumer does exactly that. Latching purely by ktime_ns let a torn-down
-// config (which really does appear, as the NEWEST record, in the recorded
-// shm_v5 fixture) become latestConfig and supply the shift that scales the
-// pprof msgs column, so the two sides could scale the same quantity
-// differently.
 func TestTornDownScopeConfigNeverScales(t *testing.T) {
 	f := newFixture(t, 1, 4096)
 	// Live config: shift 4, in force when the MSG_FLOW is written.
@@ -943,12 +894,6 @@ func TestTornDownScopeConfigNeverScales(t *testing.T) {
 	}
 }
 
-// TestRecordedFixtureV5 is the only test in this package that puts record
-// types 0x0B-0x10 (SCOPE_CONFIG, VM_STAT, MSG_FLOW, SENDER_TOPK, PORT_STAT,
-// ETS_STAT) in front of PRODUCER-GENERATED bytes. Fixtures v1/v2/v3 stop at
-// 0x0A, so before this test six of the sixteen decoders had only ever been
-// fed bytes this package's own encoders wrote -- a reader and a writer
-// agreeing with themselves. v5 carries all sixteen.
 func TestRecordedFixtureV5(t *testing.T) {
 	seg := loadRecordedSegment(t, "BEAMSCOPE_FIXTURE_V5", "shm_v5.bin")
 	recs, st := collect(seg)
@@ -1067,11 +1012,6 @@ func TestRecordedFixtureV5(t *testing.T) {
 		len(recs), byType, st.Padding, schedTypes)
 }
 
-// TestRecordedFixtureV5LiveConfig drives the real drainer over the recorded
-// v5 segment and pins the end-to-end consequence of the SCOPE_CONFIG bit0
-// rule: the newest record in that capture is a TEAR-DOWN, so a latch that
-// ordered by ktime_ns alone would adopt it as the live config and scale the
-// pprof msgs column with a shift the writer had already retired.
 func TestRecordedFixtureV5LiveConfig(t *testing.T) {
 	seg := loadRecordedSegment(t, "BEAMSCOPE_FIXTURE_V5", "shm_v5.bin")
 

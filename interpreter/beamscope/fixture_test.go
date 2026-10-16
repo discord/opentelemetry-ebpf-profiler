@@ -35,10 +35,10 @@ func pageAlign(n int) int { return (n + 4095) &^ 4095 }
 
 // newFixture builds a valid empty segment: header page + nrings rings, each
 // ring at a page-aligned offset (control block + power-of-two data area).
-func newFixture(t testing.TB, nrings, ringDataSize int) *fixture {
-	t.Helper()
+func newFixture(tb testing.TB, nrings, ringDataSize int) *fixture {
+	tb.Helper()
 	if ringDataSize&(ringDataSize-1) != 0 {
-		t.Fatalf("ringDataSize %d is not a power of two", ringDataSize)
+		tb.Fatalf("ringDataSize %d is not a power of two", ringDataSize)
 	}
 	ringSpan := pageAlign(ringCtrlSize + ringDataSize)
 	total := segmentHeaderSize + nrings*ringSpan
@@ -60,7 +60,7 @@ func newFixture(t testing.TB, nrings, ringDataSize int) *fixture {
 	le.PutUint64(f.data[40:], fixInitUnix)
 	le.PutUint64(f.data[48:], fixOSPid)
 	le.PutUint32(f.data[56:], fixOTP)
-	for i := 0; i < nrings; i++ {
+	for i := range nrings {
 		off := uint64(segmentHeaderSize + i*ringSpan)
 		f.ringOffs[i] = off
 		le.PutUint64(f.data[64+8*i:], off)
@@ -120,10 +120,10 @@ func (f *fixture) writeRecord(ring int, rec []byte) bool {
 
 // mustWrite emits one record into a ring, failing the test if the writer
 // protocol dropped it.
-func (f *fixture) mustWrite(t testing.TB, ring int, rec []byte) {
-	t.Helper()
+func (f *fixture) mustWrite(tb testing.TB, ring int, rec []byte) {
+	tb.Helper()
 	if !f.writeRecord(ring, rec) {
-		t.Fatal("fixture write failed")
+		tb.Fatal("fixture write failed")
 	}
 }
 
@@ -456,11 +456,11 @@ func encMsgFlow(ktime, unix, pidKey, arrivalsRaw uint64) []byte {
 }
 
 // mustSegment validates the fixture bytes through the real entry point.
-func (f *fixture) mustSegment(t testing.TB) *Segment {
-	t.Helper()
+func (f *fixture) mustSegment(tb testing.TB) *Segment {
+	tb.Helper()
 	seg, err := NewSegment(f.data)
 	if err != nil {
-		t.Fatalf("NewSegment: %v", err)
+		tb.Fatalf("NewSegment: %v", err)
 	}
 	return seg
 }

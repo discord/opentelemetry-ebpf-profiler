@@ -1,20 +1,10 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// Package beamscope is a Discord addition: a pseudo interpreter handler that
-// discovers the shared-memory segment exported by the beam_scope NIF
-// (discord_common/ex/beam_scope in the monorepo), drains its runtime
-// instrumentation records, and egresses them through the profiler's reporter
-// seam (GC allocation deltas as pprof samples) plus a JSONL sidecar (panel,
-// top-K send, monitor and process lifecycle records).
-//
-// Discovery follows the apmint pattern: an exported symbol in the mapped NIF
-// shared object points at a small static struct naming a memfd and segment
-// size; the reader opens /proc/<pid>/fd/<memfd> and maps the segment. The ABI
-// is frozen in discord_common/ex/beam_scope/ABI.md.
-//
-// The package is inert unless Configure is called (wired to the -beamscope
-// flag in beamscope_egress.go at the repo root).
+// Package beamscope discovers and drains the beam_scope NIF's shared-memory
+// records into the profiler reporter and an optional JSONL sidecar.
+// The ABI lives in discord_common/ex/beam_scope/ABI.md in the monorepo.
+// Configure must be called before interpreter discovery.
 package beamscope // import "go.opentelemetry.io/ebpf-profiler/interpreter/beamscope"
 
 import (
@@ -54,7 +44,7 @@ const (
 // Config enables the plugin and provides its sinks.
 type Config struct {
 	// Reporter receives GC_DELTA records as single-frame BEAM traces with
-	// origin support.TraceOriginBeamScope. Required.
+	// Required; each measurement uses its corresponding beamscope profile type.
 	Reporter reporter.TraceReporter
 	// PollInterval is how often each attached BEAM's rings are drained.
 	PollInterval time.Duration
@@ -203,16 +193,12 @@ var errNotReady = errors.New("segment not initialized yet")
 // errPermanent wraps an activation failure that can never succeed for this
 // export: the writer's discovery ABI does not match ours (bad magic/version).
 // tryActivate parks the drainer on it instead of retrying every poll for the
-// life of the process (see FIX-5).
+// life of the process.
 var errPermanent = errors.New("permanent activation failure")
 
-// openSegment reads the export struct from the target's memory, validates it,
-// opens the memfd through /proc and maps the segment.
-//
-// The mapping is MAP_SHARED and writable: the drain protocol requires the
-// reader to store read_pos back into the ring control block, which the writer
-// consults for flow control. The BEAM process can exit at any time; ENOENT,
-// ESRCH and EOF at every step are reported as plain errors for retry.
+// openSegment validates the discovery struct and maps the exported memfd.
+// The mapping is writable because draining updates each ring's read_pos.
+// Process-exit errors are retried until the process manager detaches the reader.
 func openSegment(pid libpf.PID, rm remotememory.RemoteMemory,
 	exportAddr libpf.Address) ([]byte, *Segment, error) {
 	var raw [exportStructSize]byte
@@ -273,8 +259,8 @@ func openSegment(pid libpf.PID, rm remotememory.RemoteMemory,
 }
 
 // gatherProcessMeta snapshots /proc-derived identity for sample labeling.
-func gatherProcessMeta(pid libpf.PID) process.ProcessMeta {
+func gatherProcessMeta(pid libpf.PID) process.Meta {
 	pr := process.New(pid, pid)
 	defer pr.Close()
-	return pr.GetProcessMeta(process.MetaConfig{})
+	return pr.GetProcessMeta(nil)
 }

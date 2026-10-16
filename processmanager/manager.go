@@ -224,6 +224,17 @@ func collectInterpreterMetrics(ctx context.Context, pm *ProcessManager,
 }
 
 func (pm *ProcessManager) Close() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+	pm.closed = true
+	for pid, instances := range pm.interpreters {
+		for _, instance := range instances {
+			if err := instance.Detach(pm.ebpf, pid); err != nil {
+				log.Errorf("Failed to detach interpreter for PID %d: %v", pid, err)
+			}
+		}
+		delete(pm.interpreters, pid)
+	}
 }
 
 func (pm *ProcessManager) symbolizeFrame(pid libpf.PID, data []uint64, frames *libpf.Frames, mapping libpf.FrameMapping) error {
@@ -399,8 +410,8 @@ func (pm *ProcessManager) HandleTrace(bpfTrace *libpf.EbpfTrace, profileType *sa
 		ExecutablePath: procMeta.Executable,
 		ContainerID:    procMeta.ContainerID,
 		ProfileType:    profileType,
- ErlangPidKey: bpfTrace.ErlangPidKey,
- ProcessName: procMeta.Name,
+		ErlangPidKey:   bpfTrace.ErlangPidKey,
+		ProcessName:    procMeta.Name,
 		Value:          bpfTrace.Value,
 		EnvVars:        procMeta.EnvVariables,
 		ResourceAttrs:  resourceAttrs,

@@ -30,10 +30,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
 
-// The comm strings below were observed on OTP 25.3.2.7 / erts-13.2.2.4 on
-// Linux x86_64; see parseSchedComm's doc comment. They come from
-// erl_process.c's erts_snprintf(opts.name, ..., "%lu_scheduler", ix + 1) and
-// friends, truncated by the kernel to TASK_COMM_LEN-1 = 15 bytes.
 func TestParseSchedComm(t *testing.T) {
 	for _, tc := range []struct {
 		comm     string
@@ -73,8 +69,6 @@ func TestParseSchedComm(t *testing.T) {
 	}
 }
 
-// scanSchedulerThreads must pick exactly the scheduler threads out of a real
-// task directory listing and ignore everything else.
 func TestScanSchedulerThreads(t *testing.T) {
 	root := t.TempDir()
 	taskDir := filepath.Join(root, "4242", "task")
@@ -112,10 +106,6 @@ func TestScanSchedulerThreads(t *testing.T) {
 	}, got)
 }
 
-// The offsets are identical across OTP 25-28 because the ErtsSchedulerData
-// prefix and ErtsThrPrgrData are byte-identical at those tags; see
-// schedOffsetsByOTP for the citations. TestBeamSchedLiveAttach confirms them
-// empirically on 25.
 func TestSchedOffsetsLookup(t *testing.T) {
 	for _, otp := range []uint8{25, 26, 27, 28} {
 		offs, ok := lookupSchedOffsets(otp)
@@ -130,7 +120,6 @@ func TestSchedOffsetsLookup(t *testing.T) {
 	}
 }
 
-// A pid term must be tagged and non-null, or there is no label.
 func TestIsInternalPidTerm(t *testing.T) {
 	assert.True(t, isInternalPidTerm(0x278000004f3))
 	assert.True(t, isInternalPidTerm(0x3))
@@ -141,17 +130,6 @@ func TestIsInternalPidTerm(t *testing.T) {
 	assert.False(t, isInternalPidTerm(0x278000004ff)) // small-int tag (0xf)
 }
 
-// TestBeamSchedLiveAttach exercises the whole user-space half of the feature
-// against a real VM: symbol resolution, the aligned-stride probe, the
-// esdp[i].no == i+1 tripwire, and reading current_process->common.id for a
-// process pinned to scheduler 1. It needs a local `erl` and the ability to
-// read the child's memory -- which the test gets by being the child's parent,
-// so no root is required. It skips otherwise.
-//
-// The eBPF half performs exactly the two reads this test performs (esdp +
-// off_current_proc, then *proc), so a green run here is the strongest signal
-// available without root and a rebuilt tracer object. The end-to-end
-// procedure is in doc/discord-fork.md.
 func TestBeamSchedLiveAttach(t *testing.T) {
 	if testing.Short() {
 		t.Skip("live VM test skipped in -short mode")
@@ -264,7 +242,7 @@ func liveBeamMapping(t *testing.T, pid libpf.PID) (path string, bias uint64) {
 	t.Helper()
 	maps, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", pid))
 	require.NoError(t, err)
-	for _, line := range strings.Split(string(maps), "\n") {
+	for line := range strings.SplitSeq(string(maps), "\n") {
 		if !strings.Contains(line, "beam.smp") {
 			continue
 		}
@@ -361,17 +339,13 @@ func newFakeSchedArray(t *testing.T, offs schedOffsets, kind schedKind,
 	t.Helper()
 	m := newFakeSchedMem(t, n, stride)
 	numOff, zeroOff := offs.forKind(kind)
-	for i := uint32(0); i < n; i++ {
+	for i := range n {
 		m.put(i*stride+numOff, uint64(i)+1)
 		m.put(i*stride+zeroOff, 0)
 	}
 	return m
 }
 
-// The n == 2 case is where the probe is weakest: the acceptance rule sees only
-// esdp[1], so a single stray word can impersonate a scheduler. These cases pin
-// the two defences that make it safe -- the second (zeroed) number field, and
-// the requirement that the match be unique across the whole candidate range.
 func TestProbeAlignedStride(t *testing.T) {
 	offs, ok := lookupSchedOffsets(25)
 	require.True(t, ok)
@@ -451,8 +425,6 @@ func TestProbeAlignedStride(t *testing.T) {
 		got, err := probeAlignedStride(m.rm(), m.base, 1, offs, schedKindNormal)
 		require.NoError(t, err)
 		assert.EqualValues(t, strideUndetermined, got)
-		// Whatever the reported stride, scheduler 1 addresses the base.
-		assert.Zero(t, uint64(1-1)*uint64(got))
 	})
 
 	t.Run("wrong offsets table fails at esdp[0]", func(t *testing.T) {
@@ -477,9 +449,9 @@ func TestProbeAlignedStride(t *testing.T) {
 	t.Run("implausible inputs rejected", func(t *testing.T) {
 		m := newFakeSchedArray(t, offs, schedKindNormal, 4, stride)
 		_, err := probeAlignedStride(m.rm(), 0, 4, offs, schedKindNormal)
-		assert.Error(t, err, "NULL array")
+		require.Error(t, err, "NULL array")
 		_, err = probeAlignedStride(m.rm(), m.base, 0, offs, schedKindNormal)
-		assert.Error(t, err, "zero schedulers")
+		require.Error(t, err, "zero schedulers")
 		_, err = probeAlignedStride(m.rm(), m.base, maxSchedulersPerVM+1, offs,
 			schedKindNormal)
 		assert.Error(t, err, "clamped-implausible scheduler count")
@@ -493,7 +465,7 @@ func newFakeDirtyArray(t *testing.T, offs schedOffsets, nCPU, nIO, stride uint32
 	t.Helper()
 	total := nCPU + nIO
 	m := newFakeSchedMem(t, total, stride)
-	for i := uint32(0); i < total; i++ {
+	for i := range total {
 		num := i + 1
 		if i >= nCPU {
 			num = i - nCPU + 1 // the IO half restarts at 1
@@ -504,10 +476,6 @@ func newFakeDirtyArray(t *testing.T, offs schedOffsets, nCPU, nIO, stride uint32
 	return m
 }
 
-// The dirty array is not homogeneous, so probeAlignedStride's uniqueness
-// argument does not apply to it. This reproduces, without a VM, the double
-// match observed live at `+SDcpu 2:2`, and pins the fix: measure the stride on
-// the homogeneous normal array and only VERIFY the dirty one at it.
 func TestVerifyDirtyCPUArray(t *testing.T) {
 	offs, ok := lookupSchedOffsets(25)
 	require.True(t, ok)
@@ -534,7 +502,7 @@ func TestVerifyDirtyCPUArray(t *testing.T) {
 		// not 2. (3*stride is the one value that does alias -- which is the
 		// whole reason the stride has to come from the normal array and not
 		// from anything self-consistent found here.)
-		assert.Error(t, verifyDirtyCPUArray(m.rm(), m.base, 2, 2*stride, offs))
+		require.Error(t, verifyDirtyCPUArray(m.rm(), m.base, 2, 2*stride, offs))
 	})
 
 	t.Run("no stride available with a single normal scheduler", func(t *testing.T) {
@@ -549,15 +517,11 @@ func TestVerifyDirtyCPUArray(t *testing.T) {
 
 	t.Run("null base and implausible counts rejected", func(t *testing.T) {
 		m := newFakeDirtyArray(t, offs, 2, 10, stride)
-		assert.Error(t, verifyDirtyCPUArray(m.rm(), 0, 2, stride, offs))
-		assert.Error(t, verifyDirtyCPUArray(m.rm(), m.base, maxSchedulersPerVM+1, stride, offs))
+		require.Error(t, verifyDirtyCPUArray(m.rm(), 0, 2, stride, offs))
+		require.Error(t, verifyDirtyCPUArray(m.rm(), m.base, maxSchedulersPerVM+1, stride, offs))
 	})
 }
 
-// The map value must bind the entry to the BEAM tgid: see
-// support/ebpf/beam_sched.h's identity section for why. This pins the
-// producer end; the eBPF side's comparison is compile-verified with the rest
-// of the C.
 func TestBeamSchedInfoFor(t *testing.T) {
 	offs, ok := lookupSchedOffsets(25)
 	require.True(t, ok)
@@ -574,7 +538,7 @@ func TestBeamSchedInfoFor(t *testing.T) {
 	// A single-scheduler VM has no measured stride; scheduler 1 is the base.
 	solo := &schedArray{base: 0x7f0000001000, n: 1, stride: strideUndetermined, ok: true}
 	info := beamSchedInfoFor(solo, offs, 1, 7)
-	assert.EqualValues(t, uint64(solo.base), info.Esdp_addr)
+	assert.Equal(t, uint64(solo.base), info.Esdp_addr)
 	assert.EqualValues(t, 7, info.Tgid)
 
 	// The tgid is never zero for a real process, so a zero-valued entry can
@@ -624,16 +588,6 @@ func (f *fakeSchedTidMap) DeleteBeamSchedTid(tid, tgid libpf.PID) error {
 	return nil
 }
 
-// TestDetachDoesNotDeleteRecycledTid pins the B5 fix: a dead VM's Detach must
-// not remove a live VM's beam_sched_tids entry at a kernel tid the OS recycled
-// between the two.
-//
-// Scenario: BEAM pid 100 has scheduler tid 12345 and exits. Before its Detach
-// runs, pid 200 starts, one of its scheduler threads gets the recycled tid
-// 12345, and its attach overwrites the map entry with {esdp of 200, tgid
-// 200}. Pid 100's Detach must then leave that entry alone -- deleting it
-// would silently disable pid 200's attribution on that thread for its whole
-// lifetime.
 func TestDetachDoesNotDeleteRecycledTid(t *testing.T) {
 	const recycledTid = libpf.PID(12345)
 	const deadTgid = libpf.PID(100)

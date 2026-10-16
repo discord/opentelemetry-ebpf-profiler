@@ -13,16 +13,16 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"runtime/debug"
 
 	"golang.org/x/sys/unix"
+
+	"go.opentelemetry.io/otel/metric/noop"
 
 	"go.opentelemetry.io/ebpf-profiler/internal/controller"
 	"go.opentelemetry.io/ebpf-profiler/metrics"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/times"
-	tracertypes "go.opentelemetry.io/ebpf-profiler/tracer/types"
-	"go.opentelemetry.io/ebpf-profiler/vc"
-	"go.opentelemetry.io/otel/metric/noop"
 
 	"go.opentelemetry.io/ebpf-profiler/internal/log"
 )
@@ -73,14 +73,14 @@ func mainWithExitCode() exitCode {
 	}
 
 	if cfg.Version {
-		fmt.Printf("%s\n", vc.Version())
+		fmt.Printf("%s\n", agentVersion())
 		return exitSuccess
 	}
 
 	if cfg.VerboseMode {
 		log.SetLevel(slog.LevelDebug)
 		// Dump the arguments in debug mode.
-		cfg.Dump()
+		log.Debugf("Configuration: %+v", cfg)
 	}
 
 	if err = cfg.Validate(); err != nil {
@@ -96,7 +96,7 @@ func mainWithExitCode() exitCode {
 	if cfg.PprofAddr != "" {
 		go func() {
 			//nolint:gosec
-			if err = http.ListenAndServe(cfg.PprofAddr, nil); err != nil {
+			if err := http.ListenAndServe(cfg.PprofAddr, nil); err != nil {
 				log.Errorf("Serving pprof on %s failed: %s", cfg.PprofAddr, err)
 			}
 		}()
@@ -113,42 +113,11 @@ func mainWithExitCode() exitCode {
 		metrics.Start(noop.Meter{})
 	}
 
-	// Discord (FIX-7): beamscope's per-sample num labels are encoded correctly
-	// only by the local egress's pprof-file backend, which snapshots
-	// CustomLabels per event. The OTLP/collector path aggregates on the trace
-	// hash (which excludes those labels) and would freeze them at the first
-	// event per key. Fail loud at startup rather than silently emit wrong
-	// per-sample data; the base reporter also rejects the origin as a backstop.
-	//
-	// Either local backend satisfies this: socket wire v2 carries value,
-	// value_kind, erlang_pid_key and typed custom labels, so socket-only is a
-	// complete beamscope capture. What is still not sufficient is OTLP or no
-	// egress at all.
 	if beamscopeEgress.enabled && !beamscopeEgressSupported() {
 		return failure("-beamscope requires a local egress (-pprof-dir or " +
 			"-socket-egress); the OTLP path freezes per-sample beamscope labels")
 	}
 
-	// Discord: per-sample Erlang attribution (erlang_pid_key, section 3.9 of
-	// doc/discord-fork.md) is switched on by "-tracers beam" ALONE -- it does
-	// not need -beamscope -- and reaches BOTH local backends: the pprof file
-	// writes it as a numeric label, socket wire v2 as a fixed field. The OTLP
-	// reporter never emits it, so "-tracers beam" with no local egress still
-	// pays the whole attach-time stride probe and then drops every label it
-	// bought. Warn rather than fail: the BEAM tracer is genuinely useful
-	// without the attribution, but the loss must not be silent.
-	if !localEgressEnabled() {
-		if it, perr := tracertypes.Parse(cfg.Tracers); perr == nil &&
-			it.Has(tracertypes.BEAMTracer) {
-			log.Warn("the beam tracer is enabled without a local egress " +
-				"(-pprof-dir or -socket-egress): for any BEAM process profiled " +
-				"here, per-sample Erlang attribution (erlang_pid_key) is " +
-				"computed and then DROPPED -- the OTLP reporter cannot carry it")
-		}
-	}
-
-	// Discord: with -pprof-dir and/or -socket-egress, egress is local; see
-	// pprof_egress.go.
 	if localEgressEnabled() {
 		rep, err := newLocalEgressReporter(int(cfg.SamplesPerSecond))
 		if err != nil {
@@ -166,7 +135,7 @@ func mainWithExitCode() exitCode {
 	} else {
 		rep, err := reporter.NewOTLP(&reporter.Config{
 			Name:                   os.Args[0],
-			Version:                vc.Version(),
+			Version:                agentVersion(),
 			CollAgentAddr:          cfg.CollAgentAddr,
 			DisableTLS:             cfg.DisableTLS,
 			MaxRPCMsgSize:          32 << 20, // 32 MiB
@@ -192,15 +161,19 @@ func mainWithExitCode() exitCode {
 		return exitFailure
 	}
 
-	log.Infof("Starting OTEL profiling agent %s (revision %s, build timestamp %s)",
-		vc.Version(), vc.Revision(), vc.BuildTimestamp())
+	log.Infof("Starting OTEL profiling agent %s", agentVersion())
 
-	ctlr := controller.New(cfg)
+	ctlr := controller.New(&cfg.Config)
+	defer ctlr.Shutdown()
 	err = ctlr.Start(ctx)
 	if err != nil {
 		return failure("Failed to start agent controller: %v", err)
 	}
-	defer ctlr.Shutdown()
+	cleanupProbes, err := enableCLIProbes(ctx, ctlr, cfg)
+	if err != nil {
+		return failure("Failed to enable probes: %v", err)
+	}
+	defer cleanupProbes()
 
 	// Block waiting for a signal to indicate the program should terminate
 	<-ctx.Done()
@@ -212,4 +185,11 @@ func mainWithExitCode() exitCode {
 func failure(msg string, args ...any) exitCode {
 	log.Errorf(msg, args...)
 	return exitFailure
+}
+
+func agentVersion() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		return info.Main.Version
+	}
+	return "unknown"
 }

@@ -71,7 +71,6 @@ func TestBaseReporterRejectsBeamScopeOrigin(t *testing.T) {
 	reporter := createTestBaseReporter(t, nil)
 
 	trace := &libpf.Trace{
-		Hash: libpf.NewTraceHash(0x1111111100000000, 0x0),
 		Frames: func() libpf.Frames {
 			frames := make(libpf.Frames, 0, 1)
 			frames.Append(&libpf.Frame{
@@ -82,19 +81,19 @@ func TestBaseReporterRejectsBeamScopeOrigin(t *testing.T) {
 		}(),
 	}
 	meta := &samples.TraceEventMeta{
-		Timestamp: libpf.UnixTime64(time.Now().UnixNano()),
-		PID:       4242,
-		TID:       4242,
-		Origin:    support.TraceOriginBeamScope,
+		Timestamp:   libpf.UnixTime64(time.Now().UnixNano()),
+		PID:         4242,
+		TID:         4242,
+		ProfileType: samples.BeamScopeProfile(samples.ValueKindAlloc),
 	}
 
 	err := reporter.ReportTraceEvent(trace, meta)
 	require.Error(t, err, "base reporter must reject the beamscope origin")
-	require.ErrorIs(t, err, errUnknownOrigin)
+	require.ErrorIs(t, err, errUnknownProfileType)
 
 	// A normal sampling event is still accepted, so the rejection is scoped to
 	// the beamscope origin only.
-	meta.Origin = support.TraceOriginSampling
+	meta.ProfileType = profileTypeSampling
 	require.NoError(t, reporter.ReportTraceEvent(trace, meta))
 }
 

@@ -19,24 +19,8 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
-// TestGenerateEquivalenceFixture replays REAL captures back through
-// ReportTraceEvent with both egresses attached, and writes the two artifacts
-// side by side:
-//
-//	$PSTORE_EQUIV_OUT/pprof/*.pb.gz   the pprof path's output
-//	$PSTORE_EQUIV_OUT/stream.bin      the socket path's output, byte for byte
-//	$PSTORE_EQUIV_OUT/manifest.json   what was replayed, and the counters
-//
-// Both come from the SAME ReportTraceEvent calls, so a difference between the
-// flame graphs a consumer derives from them is a real semantic divergence in
-// this fork's socket path and nothing else. That is the acceptance test the
-// Rust side runs; this is only the fixture for it.
-//
-// Skipped unless PSTORE_EQUIV_OUT is set, so it costs a normal `go test`
-// nothing and never needs the corpus to exist.
 func TestGenerateEquivalenceFixture(t *testing.T) {
 	out := os.Getenv("PSTORE_EQUIV_OUT")
 	if out == "" {
@@ -81,13 +65,11 @@ func TestGenerateEquivalenceFixture(t *testing.T) {
 	require.NoError(t, err)
 	var wg sync.WaitGroup
 	if !noSocket {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			// The same accept/drain loop the socket tests use, with the
 			// fixture file as the sink instead of an in-memory buffer.
 			serveOne(ln, f, nil)
-		}()
+		})
 	}
 
 	// An empty procfs makes lineage deterministically unresolved: the replay
@@ -207,23 +189,23 @@ func metaFromPprofSample(s *profile.Sample) *samples.TraceEventMeta {
 		}
 		return ""
 	}
-	origin := libpf.Origin(support.TraceOriginSampling)
+	profileType := profileTypeSampling
 	switch strings.TrimSpace(str(LabelOrigin)) {
 	case "off_cpu":
-		origin = libpf.Origin(support.TraceOriginOffCPU)
+		profileType = profileTypeOffCPU
 	case "probe":
-		origin = libpf.Origin(support.TraceOriginProbe)
+		profileType = profileTypeProbe
 	}
 	return &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(num(LabelTimestampNs)),
 		KTime:          num(LabelKTimeNs),
-		Comm:           libpf.Intern(str(LabelComm)),
+		Comm:           libpf.NewCommFromString(str(LabelComm)),
 		ProcessName:    libpf.Intern(str(LabelProcessName)),
 		ExecutablePath: libpf.Intern(str(LabelExecutable)),
 		ContainerID:    libpf.Intern(str(LabelContainerID)),
 		PID:            libpf.PID(num(LabelPID)),
 		TID:            libpf.PID(num(LabelTID)),
-		CPU:            int(num(LabelCPU)),
-		Origin:         origin,
+		CPU:            uint32(num(LabelCPU)),
+		ProfileType:    profileType,
 	}
 }

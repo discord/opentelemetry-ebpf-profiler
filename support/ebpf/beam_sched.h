@@ -1,31 +1,8 @@
-// Per-sample Erlang process attribution.
-//
-// Discord addition. At perf-sample time, for a tid known to be a BEAM
-// scheduler thread, read esdp->current_process and stamp the raw pid Eterm on
-// the trace.
-//
-// Coherence: the perf interrupt runs on the CPU executing that scheduler
-// thread, and the only writer of current_process is the interrupted thread
-// itself, so the read is quiescent -- there is no other thread that could be
-// mutating the field while we are stopped in the interrupt. A stale value is
-// bounded by dispatch latency (the window between the scheduler picking a
-// process and assigning the field), and the tag check below plus the null
-// check turn any mid-dispatch race into "no label", never a wrong label.
-//
-// Identity: the map is keyed by global kernel tid, and kernel tids are
-// reused. If a Detach is ever missed -- a dropped process-exit notification,
-// which is an unbounded window -- an unrelated thread could inherit a mapped
-// tid, and the two reads below would then happen at a dead VM's addresses in
-// the NEW process's address space, where they may well be mapped and may well
-// pass the tag check. So the entry carries the tgid it was written for and
-// this helper refuses to stamp anything when the sampled process is not that
-// one. Without that binding "never a wrong label" would not be true.
-//
-// Everything version-specific -- which tid is a scheduler, where its
-// ErtsSchedulerData lives, and where current_process sits inside it -- is
-// resolved and tripwire-validated in user space before beam_sched_tids gains
-// an entry (interpreter/beam/beam_sched.go). If any of that fails the map
-// stays empty for that process and this helper is a single failed map lookup.
+// Attribute a CPU sample to the Erlang process running on a known scheduler.
+// Scheduler addresses and offsets are validated in user space. Bind entries
+// to tgid because kernel TIDs can be reused before a stale entry is detached.
+// The perf interrupt pauses the scheduler that owns current_process; null or
+// invalid PID terms leave the sample unattributed.
 
 #ifndef OPTI_BEAM_SCHED_H
 #define OPTI_BEAM_SCHED_H
@@ -47,8 +24,7 @@ static EBPF_INLINE void beam_stamp_current_process(Trace *trace, u32 pid, u32 ti
     return;
   }
   if (si->tgid != pid) {
-    // A stale entry whose tid has been reused by another process; see the
-    // identity section above.
+    // This TID now belongs to another process.
     return;
   }
 

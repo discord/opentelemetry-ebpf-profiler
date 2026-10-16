@@ -1,14 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// Discord addition. Record decoding for the beam_scope shared-memory ABI v1.
-// The layout is specified in the monorepo at discord_common/ex/beam_scope/ABI.md;
-// this file is the reader side of that contract and must not drift from it.
-//
-// All integers little-endian. Records are length-prefixed TLVs, 8-byte aligned,
-// with a fixed 24-byte header carrying both clocks. Payload fields are packed
-// sequentially with no inter-field padding; strings are a u8 length followed by
-// the bytes (no NUL); the whole record is padded to 8-byte alignment at the end.
+// Record layouts from discord_common/ex/beam_scope/ABI.md. Integers are
+// little-endian; records have a 24-byte header and are padded to 8 bytes.
+// Payload fields are packed, and strings have a u8 length with no NUL.
 package beamscope // import "go.opentelemetry.io/ebpf-profiler/interpreter/beamscope"
 
 import (
@@ -60,12 +55,8 @@ const (
 	// schedUtilFlagMsaccValid: the msacc microstate fields carry data (zero
 	// otherwise, when msacc is not enabled in the writer's config).
 	schedUtilFlagMsaccValid = 1 << 0
-	// schedUtilFlagMsaccOnly: this row is an aux (sched_type 3) or poll
-	// (sched_type 4) thread, which has no scheduler_wall_time entry -- the
-	// writer zero-fills active_ns/total_ns, and scheduler_id is the PER-TYPE
-	// msacc id, so it collides with a real scheduler's id. A consumer
-	// computing active/total per scheduler must exclude these rows rather
-	// than read the zeroes as "idle since the previous tick".
+	// schedUtilFlagMsaccOnly marks aux/poll threads. Their active_ns/total_ns
+	// are unavailable and their per-type IDs may overlap scheduler IDs.
 	schedUtilFlagMsaccOnly = 1 << 1
 	// schedDeltaFlagUnclassified: preempt/yield classification unsupported by
 	// this writer; those counters are zero, nswitches is still valid.

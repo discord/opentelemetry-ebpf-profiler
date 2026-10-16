@@ -410,19 +410,6 @@ typedef enum TracePrograms {
   NUM_TRACER_PROGS,
 } TracePrograms;
 
-// TraceOrigin describes the source of the trace. This enables
-// origin specific handling of traces in user space.
-typedef enum TraceOrigin {
-  TRACE_UNKNOWN,
-  TRACE_SAMPLING,
-  TRACE_OFF_CPU,
-  TRACE_PROBE,
-  // Discord: samples synthesized in user space by the beamscope plugin
-  // (interpreter/beamscope) from BEAM shm records. No eBPF program emits
-  // this origin; it exists here so the generated Go constant survives regen.
-  TRACE_BEAMSCOPE,
-} TraceOrigin;
-
 // Maximum number of unique stack deltas needed on a system. This is based on
 // normal desktop /usr/bin/* and /usr/lib/*.so having about 9700 unique deltas.
 // Can be increased up to 2^15, see also STACK_DELTA_COMMAND_FLAG.
@@ -668,19 +655,8 @@ typedef struct LuaJITProcInfo {
   u8 dummy;
 } LuaJITProcInfo;
 
-// BeamSchedInfo is the per-scheduler-thread data needed to attribute a CPU
-// sample to the Erlang process the scheduler is running. It is keyed by kernel
-// tid, so one entry exists per BEAM scheduler thread on the host.
-//
-// esdp_addr is the already-biased address of this thread's ErtsSchedulerData
-// (i.e. &erts_aligned_scheduler_data[no-1], or the dirty-CPU array's
-// equivalent); off_current_proc is offsetof(ErtsSchedulerData,
-// current_process). Both are resolved and validated in user space before the
-// entry is written -- see interpreter/beam/beam_sched.go -- so the eBPF side
-// never has to reason about OTP versions.
-//
-// tgid is the BEAM process the entry was written for. See beam_sched.h's
-// identity section for why the map value must be bound to it.
+// Scheduler address, current_process offset and owning tgid. User space validates
+// the layout before populating beam_sched_tids; tgid guards against TID reuse.
 typedef struct BeamSchedInfo {
   u64 esdp_addr;
   u32 off_current_proc;

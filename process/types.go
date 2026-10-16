@@ -105,6 +105,7 @@ type MachineData struct {
 
 // ProcessMeta contains metadata about a tracked process.
 type Meta struct {
+	Name libpf.String
 	// executable path retrieved from /proc/PID/exe
 	Executable libpf.String
 	// process env vars from /proc/PID/environ that may be reported

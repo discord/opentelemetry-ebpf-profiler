@@ -3,15 +3,7 @@
 
 package main
 
-// Discord addition: wiring for the local egress path
-// (reporter.LocalEgressReporter). Kept in its own file so the delta on
-// upstream's main.go and cli_flags.go is two calls, which is what keeps rebases
-// cheap.
-//
-// The local egress has two INDEPENDENT backends, selected by their own flags:
-// -pprof-dir writes pprof files, -socket-egress streams the same samples over a
-// unix socket. Either, both, or neither: with neither, the agent ships OTLP to a
-// collection agent exactly as upstream does.
+// CLI configuration for the local pprof and socket reporters.
 
 import (
 	"flag"
@@ -51,59 +43,20 @@ const pprofDirHelp = "Write pprof files to this directory instead of sending OTL
 	"with per-sample kernel timestamp, pid, tid, comm, process name and container id."
 
 var (
-	pprofFlushIntervalHelp = fmt.Sprintf("How often the local pprof egress writes a file "+
-		"(default %s). This is a file-size knob, not a resolution knob: finer windows are "+
-		"cut offline from the per-sample kernel timestamps.",
-		reporter.DefaultPprofFlushInterval)
-	pprofMaxBufferedHelp = fmt.Sprintf("Maximum samples buffered between flushes of the "+
-		"local pprof egress (default %d). Samples beyond this are dropped, counted, and "+
-		"reported in the next profile's comments.",
-		reporter.DefaultPprofMaxBufferedSamples)
-	pprofKeepPIDsHelp = "Comma-separated PIDs to record, for the local egress. Applied " +
-		"above the fan-out, so it restricts BOTH backends (pprof files and the socket " +
-		"stream). Empty records every process. Prefer filtering offline on the sample " +
-		"labels, which keeps one capture re-sliceable."
-	pprofKeepCommsHelp = "Comma-separated thread names (comm) to record, for the local " +
-		"egress. Applied above the fan-out, so it restricts BOTH backends. Empty " +
-		"records every thread."
-
-	socketPathHelp = "Stream every sample over this unix socket (the CONSUMER listens, " +
-		"the agent dials and reconnects). Independent of -pprof-dir: use either, both, " +
-		"or neither. With both, the same sample reaches both and pprof files are written " +
-		"unchanged. This is the sub-iteration-resolution path: the pprof flush interval " +
-		"is a file-size knob and cannot resolve a 1-3s iteration."
-	socketRingHelp = fmt.Sprintf("Samples queued between the sampling path and the socket "+
-		"writer (default %d). The agent NEVER blocks on a slow consumer: beyond this, "+
-		"samples are dropped and counted, and the count rides on the wire next to the gap "+
-		"it describes.", reporter.DefaultSocketRingSize)
-	socketMaxFramesHelp = fmt.Sprintf("Maximum frames emitted per sample over the socket "+
-		"(default %d). A capped sample is flagged on the wire and counted; the pprof file "+
-		"never truncates, so a capped sample is NOT equivalent between the two paths.",
-		reporter.DefaultSocketMaxFrames)
-	socketFlushIntervalHelp = fmt.Sprintf("Safety net bounding how long a serialized "+
-		"record may sit in the socket write buffer (default %s). NOT the latency floor: "+
-		"every sample is flushed as it is written, so this ticker normally finds an empty "+
-		"buffer.", reporter.DefaultSocketFlushInterval)
-	socketWriteTimeoutHelp = fmt.Sprintf("How long one socket record write may take "+
-		"before the consumer is declared gone and the connection is torn down "+
-		"(default %s, clamped to [250ms, 5s]). A consumer that cannot keep up costs "+
-		"samples, never agent latency. Shutdown waits this long plus 1s of slack, so "+
-		"raising it also raises the shutdown backstop: the write deadline always "+
-		"fires first, which is what makes a wedged consumer's loss exact rather "+
-		"than approximate.", reporter.DefaultSocketWriteTimeout)
-	socketStatsIntervalHelp = fmt.Sprintf("How often a STATS record (the absolute "+
-		"counters) is emitted on the socket (default %s). Also emitted right after the "+
-		"header and before a clean close.", reporter.DefaultSocketStatsInterval)
+	pprofFlushIntervalHelp  = fmt.Sprintf("Write a pprof file at this interval (default %s). Samples retain their individual timestamps.", reporter.DefaultPprofFlushInterval)
+	pprofMaxBufferedHelp    = fmt.Sprintf("Maximum buffered pprof samples (default %d). Excess samples are dropped and counted.", reporter.DefaultPprofMaxBufferedSamples)
+	pprofKeepPIDsHelp       = "Comma-separated PIDs to record in both local outputs. Empty records all processes."
+	pprofKeepCommsHelp      = "Comma-separated thread names to record in both local outputs. Empty records all threads."
+	socketPathHelp          = "Stream samples to this Unix socket. The consumer listens and the agent reconnects. Can be used with -pprof-dir."
+	socketRingHelp          = fmt.Sprintf("Maximum queued socket samples (default %d). Excess samples are dropped and counted.", reporter.DefaultSocketRingSize)
+	socketMaxFramesHelp     = fmt.Sprintf("Maximum frames per socket sample (default %d). Truncated stacks are flagged.", reporter.DefaultSocketMaxFrames)
+	socketFlushIntervalHelp = fmt.Sprintf("Maximum buffered socket-record latency (default %s). Samples are also flushed individually.", reporter.DefaultSocketFlushInterval)
+	socketWriteTimeoutHelp  = fmt.Sprintf("Socket write timeout (default %s, clamped to [250ms, 5s]).", reporter.DefaultSocketWriteTimeout)
+	socketStatsIntervalHelp = fmt.Sprintf("Interval between socket counter snapshots (default %s).", reporter.DefaultSocketStatsInterval)
 )
 
-// registerPprofEgressFlags adds the local-pprof egress flags.
-//
-// The tunables are registered with a ZERO default on purpose. Every one of them
-// already has a `if cfg.X <= 0 { cfg.X = defaultX }` fallback in the reporter
-// package, and duplicating the numbers here means two places to change and a
-// silent disagreement when only one of them is changed. Zero here means "not
-// specified"; the reporter picks the default, whose value the help string above
-// interpolates from the same constant.
+// registerPprofEgressFlags registers local output flags. Zero-valued tunables
+// use the defaults exported by the reporter package.
 func registerPprofEgressFlags(fs *flag.FlagSet) {
 	fs.StringVar(&pprofEgress.dir, "pprof-dir", "", pprofDirHelp)
 	fs.DurationVar(&pprofEgress.flushInterval, "pprof-flush-interval", 0,
@@ -143,13 +96,7 @@ func pprofEgressEnabled() bool { return pprofEgress.dir != "" }
 // condition for taking the local path instead of OTLP.
 func localEgressEnabled() bool { return pprofEgressEnabled() || socketEgressEnabled() }
 
-// beamscopeEgressSupported reports whether the selected egress can actually
-// carry beamscope's per-sample data. Both local backends can: the socket wire
-// carries value/value_kind, erlang_pid_key and typed custom labels as of
-// version 2, resolved by the same rules the pprof path uses, so a socket-only
-// capture is beamscope-complete rather than silently stripped. What is still
-// not sufficient is no local egress at all -- the OTLP path freezes per-sample
-// beamscope labels.
+// beamscopeEgressSupported requires an output that preserves per-event labels.
 func beamscopeEgressSupported() bool { return localEgressEnabled() }
 
 // newLocalEgressReporter builds the local egress reporter. samplesPerSecond must
@@ -196,7 +143,7 @@ func splitList(csv string) []string {
 		return nil
 	}
 	var out []string
-	for _, part := range strings.Split(csv, ",") {
+	for part := range strings.SplitSeq(csv, ",") {
 		if part = strings.TrimSpace(part); part != "" {
 			out = append(out, part)
 		}

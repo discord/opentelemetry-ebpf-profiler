@@ -431,11 +431,6 @@ func TestDecodeGolden(t *testing.T) {
 	}
 }
 
-// TestMonitorEventPackedLayout pins the ABI ruling that payload fields are
-// packed in listed order with no inter-field padding: MONITOR_EVENT's value
-// sits at payload offset 9 (after pid_key u64 + kind u8), not at a naturally
-// aligned offset 16. Both encodings pad to the same record length, so only a
-// byte-level check can catch a drift here.
 func TestMonitorEventPackedLayout(t *testing.T) {
 	const value = uint64(0x1122334455667788)
 	raw := encMonitorEvent(tK, tU, 0xaabb, 3, value)
@@ -494,15 +489,6 @@ func BenchmarkDecodeRecord(b *testing.B) {
 	}
 }
 
-// TestDecodeScopeConfigLengths pins the three known SCOPE_CONFIG payload
-// lengths (36, 40, 48) and the absent-field convention: a field past the
-// writer's length decodes as the Go zero value AND PayloadLen says so, so a
-// consumer can tell "0" from "this writer never had the field". These are
-// kept out of TestDecodeGolden because encScopeConfig(36, ...) deliberately
-// builds a non-8-aligned total record length (60 bytes) to make length 36
-// distinguishable on the wire from length 40 with tick_ms == 0 -- see
-// encScopeConfig's doc comment -- and the golden table asserts 8-byte
-// alignment on every fixture.
 func TestDecodeScopeConfigLengths(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -720,13 +706,6 @@ func TestDecodeEmptyStrings(t *testing.T) {
 	}
 }
 
-// TestDecodeGCDelta2NoStart pins the NO_START flag (0x08 bit0). The writer
-// sets it when the matching gc_start was never observed and then ZERO-FILLS
-// pause_ns and mbuf_words; gc_kind is meaningless. Without the decode a
-// NO_START record is indistinguishable from a genuine 0 ns pause on a
-// zero-mbuf GC, and gets averaged into GC-pause statistics as if measured.
-// The encoder writes NONZERO values into those fields on purpose here: a
-// reader that merely echoed the bytes would pass a zero-valued fixture.
 func TestDecodeGCDelta2NoStart(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
@@ -761,13 +740,6 @@ func TestDecodeGCDelta2NoStart(t *testing.T) {
 	}
 }
 
-// TestDecodeSchedUtilMsaccOnly pins MSACC_ONLY (0x09 bit1). Aux (sched_type
-// 3) and poll (sched_type 4) threads have no scheduler_wall_time entry, so
-// the writer zero-fills active_ns/total_ns and scheduler_id is the PER-TYPE
-// msacc id. Without the decode those rows reach JSONL as
-// "active_ns: 0, total_ns: 0, msacc_valid: true" -- indistinguishable from a
-// scheduler that was idle since the previous tick, and colliding with a real
-// scheduler's id.
 func TestDecodeSchedUtilMsaccOnly(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
@@ -812,10 +784,6 @@ func TestDecodeSchedUtilMsaccOnly(t *testing.T) {
 	}
 }
 
-// TestDecodeSchedUtilMsaccOnlyWithoutValid covers the flag combination this
-// reader must not conflate: bit1 without bit0. Each bit answers a separate
-// question (is this an aux/poll row? do the microstate fields carry data?)
-// and neither may imply the other.
 func TestDecodeSchedUtilMsaccOnlyWithoutValid(t *testing.T) {
 	raw := encSchedUtil(schedUtilFlagMsaccOnly, tK, tU, 2, 3, 3,
 		0, 0, 0, 0, 0, 0, 0)
@@ -830,10 +798,6 @@ func TestDecodeSchedUtilMsaccOnlyWithoutValid(t *testing.T) {
 	}
 }
 
-// TestDecodeScopeConfigSubsystemFlags pins SCOPE_CONFIG bits 1/2/3
-// (MONITORS_ACTIVE, PROCS_ACTIVE, RECV_ACTIVE). They used to survive only as
-// the raw record_flags envelope field, forcing every consumer to re-decode
-// the producer's ABI by hand.
 func TestDecodeScopeConfigSubsystemFlags(t *testing.T) {
 	for _, tc := range []struct {
 		name                     string

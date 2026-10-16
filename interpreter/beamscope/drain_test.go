@@ -3,11 +3,6 @@
 
 package beamscope
 
-// Drainer-lifecycle tests: panic containment (FIX-3), permanent-activation
-// parking (FIX-5) and PROC_EXIT meta-cache eviction (FIX-6). These exercise
-// the drainer against in-memory segments and a fake remote memory, no live
-// BEAM.
-
 import (
 	"encoding/binary"
 	"io"
@@ -28,10 +23,6 @@ func (panicReporter) ReportTraceEvent(*libpf.Trace, *samples.TraceEventMeta) err
 	panic("beamscope test: induced drain-path panic")
 }
 
-// TestDrainGoroutineRecoversFromPanic is FIX-3: a panic in the per-PID drain
-// goroutine must unwind only that PID's drain (park it, release it) and never
-// take down host-wide profiling. Before the recover, the goroutine had no
-// backstop and the panic would crash the whole profiler process.
 func TestDrainGoroutineRecoversFromPanic(t *testing.T) {
 	f := newFixture(t, 1, 4096)
 	// PROC_META first so the GC_DELTA is reported immediately (not held),
@@ -89,10 +80,6 @@ func newActivationDrainer(export []byte) *drainer {
 	}
 }
 
-// TestTryActivatePermanentFailureParksDrainer is FIX-5: a permanently
-// malformed export (bad magic/version) must set dead so the drainer stops
-// re-running readlink/open/fstat/mmap every poll for the life of the process.
-// A transient not-ready export must NOT park it.
 func TestTryActivatePermanentFailureParksDrainer(t *testing.T) {
 	t.Run("bad magic parks", func(t *testing.T) {
 		d := newActivationDrainer(exportBytes(0xdeadbeefdeadbeef, exportVersion, 0))
@@ -127,9 +114,6 @@ func TestTryActivatePermanentFailureParksDrainer(t *testing.T) {
 	})
 }
 
-// TestReporterMetaCacheEvictedOnProcExit is FIX-6: PROC_EXIT must evict the
-// pprof sink's pid_key->meta cache. Without it the cache leaks one entry per
-// exited pid; under process churn it grows without bound.
 func TestReporterMetaCacheEvictedOnProcExit(t *testing.T) {
 	f := newFixture(t, 2, 4096)
 	seg := f.mustSegment(t)
@@ -137,7 +121,7 @@ func TestReporterMetaCacheEvictedOnProcExit(t *testing.T) {
 
 	const churn = 200
 	maxCache := 0
-	for i := 0; i < churn; i++ {
+	for i := range churn {
 		pk := uint64(0x1000 + i)
 		// Spawn: PROC_META then a GC_DELTA (reported immediately, since meta is
 		// cached in the same pass), then PROC_EXIT.
@@ -159,16 +143,6 @@ func TestReporterMetaCacheEvictedOnProcExit(t *testing.T) {
 	}
 }
 
-// TestLatestScopeConfigSelectedByMaxKtimeAcrossRings pins the ABI.md rule:
-// latestConfig is selected by MAX ktime_ns ACROSS ALL RINGS, not by which
-// record the drainer happened to process most recently. Ring 2's config
-// carries the later ktime_ns; it is drained (and so dispatched) BEFORE ring
-// 0's, in the same poll -- so a naive "last dispatched wins" implementation
-// would already pass here. The second half of the test is what actually
-// catches that bug: a config with an EARLIER ktime_ns arrives on ring 0 in a
-// LATER poll (so it is genuinely "processed more recently" in wall-clock
-// dispatch order) and must NOT displace the still-later-ktime config already
-// held from ring 2.
 func TestLatestScopeConfigSelectedByMaxKtimeAcrossRings(t *testing.T) {
 	f := newFixture(t, 3, 4096)
 	// Ring 2: the later-ktime config, drained first within the pass (ring
@@ -229,10 +203,6 @@ func TestLatestScopeConfigSelectedByMaxKtimeAcrossRings(t *testing.T) {
 	d.shutdown()
 }
 
-// TestEvictMetaOnExitRespectsSettlingHold is FIX-6's guard: while a
-// pprof-bound record for a pid is still parked awaiting its PROC_META, a
-// PROC_EXIT for that pid must not evict (there is nothing cached to evict yet,
-// and the held record still needs naming when its meta arrives).
 func TestEvictMetaOnExitRespectsSettlingHold(t *testing.T) {
 	d := newTestDrainer(t, nil, &mockReporter{}, "", testPID)
 	const pk = uint64(0x9)
@@ -262,9 +232,6 @@ func TestEvictMetaOnExitRespectsSettlingHold(t *testing.T) {
 	}
 }
 
-// Both inputs to the receive-sample scaling come from an untrusted shared
-// memory segment. Wrapping into a negative message count would be summed into
-// a pprof total; saturating keeps a nonsense input visibly nonsense.
 func TestScaleArrivalsSaturates(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

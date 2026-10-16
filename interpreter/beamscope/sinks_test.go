@@ -3,18 +3,43 @@
 
 package beamscope
 
-// MSG_FLOW's scaling by the SCOPE_CONFIG recv_sample_shift that was in force
-// when the record was written, the "msg" beamscope kind, and the guard that
-// skips synthesizing a pprof sample when no retained config can scale the
-// record. JSONL still gets the raw record regardless (see
-// TestPipelineScopeTypes and dispatch in drain.go); these tests only pin the
-// pprof-side behavior.
-
 import (
 	"testing"
 
+	"github.com/stretchr/testify/require"
+
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
+
+func TestMsgFlowWithKnownProcessWaitsForConfigInLaterRing(t *testing.T) {
+	f := newFixture(t, 2, 4096)
+	f.mustWrite(t, 0, encProcMeta(tK, tU, msgFlowPidKey, 0, 0, "Elixir.App", "run", "<0.1.0>"))
+	f.mustWrite(t, 0, encMsgFlow(tK+1, tU+1, msgFlowPidKey, 9))
+	f.mustWrite(t, 1, (msgFlowCfg{ktime: tK, payloadLen: 48, recvShift: 6}).enc())
+	mock := &mockReporter{}
+	d := newTestDrainer(t, f.mustSegment(t), mock, "", testPID)
+	t.Cleanup(d.shutdown)
+	drainUntilSettled(d)
+
+	require.Len(t, mock.metas, 1)
+	require.Equal(t, int64(9<<6), mock.metas[0].Value)
+	require.Equal(t, msgFlowPidKey, mock.metas[0].ErlangPidKey)
+	require.Zero(t, d.msgFlowScaleSkipped)
+}
+
+func TestExitedProcessMetadataReleasedAfterMessageConfigWait(t *testing.T) {
+	f := newFixture(t, 1, 4096)
+	f.mustWrite(t, 0, encProcMeta(tK, tU, msgFlowPidKey, 0, 0, "Elixir.App", "run", "<0.1.0>"))
+	f.mustWrite(t, 0, encMsgFlow(tK+1, tU+1, msgFlowPidKey, 9))
+	f.mustWrite(t, 0, encProcExit(tK+2, tU+2, msgFlowPidKey, 0))
+	d := newTestDrainer(t, f.mustSegment(t), &mockReporter{}, "", testPID)
+	t.Cleanup(d.shutdown)
+	drainUntilSettled(d)
+
+	require.Equal(t, uint64(1), d.msgFlowScaleSkipped)
+	require.Empty(t, d.rep.metaCache)
+	require.Empty(t, d.exitedPids)
+}
 
 // msgFlowPidKey is the destination pid_key every MSG_FLOW in this file is
 // addressed to. No PROC_META is ever written for it, so a record settles out
@@ -59,9 +84,6 @@ func msgFlowRig(t *testing.T, nrings int, cfgs []msgFlowCfg,
 	return d, mock
 }
 
-// TestMsgFlowScaledSample pins the MsgFlow->pprof value math: the SCOPE_CONFIG
-// in force when the record was written supplies the shift, and the
-// synthesized sample's value is raw << shift, kind "msg".
 func TestMsgFlowScaledSample(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
@@ -90,17 +112,13 @@ func TestMsgFlowScaledSample(t *testing.T) {
 				t.Fatalf("reported %d traces, want 1", len(mock.traces))
 			}
 			m := mock.metas[0]
-			if m.ValueKind != samples.ValueKindMsgs {
+			if samples.BeamScopeValueKind(m.ProfileType) != samples.ValueKindMsgs {
 				t.Fatalf("ValueKind = %d, want ValueKindMsgs (%d)",
-					m.ValueKind, samples.ValueKindMsgs)
+					samples.BeamScopeValueKind(m.ProfileType), samples.ValueKindMsgs)
 			}
 			if m.Value != tc.want {
 				t.Fatalf("Value = %d, want %d (%d << %d)",
 					m.Value, tc.want, tc.arrivals, tc.shift)
-			}
-			if m.OffTime != 0 {
-				t.Errorf("OffTime = %d, want 0 (retired as a beamscope value channel)",
-					m.OffTime)
 			}
 			if got := mock.traces[0].CustomLabels[labelBeamscopeKind].String(); got != "msg" {
 				t.Errorf("beamscope_kind = %q, want msg", got)
@@ -112,9 +130,6 @@ func TestMsgFlowScaledSample(t *testing.T) {
 	}
 }
 
-// TestMsgFlowSkippedWhenNothingCanScaleIt: when no retained SCOPE_CONFIG that
-// predates the record can supply a shift, no pprof sample is synthesized and
-// the skip is counted. The shift is never guessed.
 func TestMsgFlowSkippedWhenNothingCanScaleIt(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -152,15 +167,6 @@ func TestMsgFlowSkippedWhenNothingCanScaleIt(t *testing.T) {
 	}
 }
 
-// TestMsgFlowNotScaledByConfigNewerThanRecord is FIX-B4(a): the max-ktime
-// rule governs which config is HELD, never which config a record is scaled
-// BY. DrainInto walks rings 0..n-1 while the writer only orders records
-// within a ring, so a config drained early in a pass can be NEWER than a
-// MSG_FLOW drained later in the SAME pass. Here ring 0 carries the old
-// config (shift 4) and then a newer one (shift 0); the MSG_FLOW on ring 1 was
-// written between them, so it must be scaled by 4 -- the shift actually in
-// force when it was written -- even though shift 0 is what is latched by the
-// time the record is dispatched.
 func TestMsgFlowNotScaledByConfigNewerThanRecord(t *testing.T) {
 	d, mock := msgFlowRig(t, 2, []msgFlowCfg{
 		{ring: 0, ktime: tK, payloadLen: 48, recvShift: 4},
@@ -184,15 +190,6 @@ func TestMsgFlowNotScaledByConfigNewerThanRecord(t *testing.T) {
 	}
 }
 
-// TestMsgFlowScaledByConfigFromALaterRing is the mirror image of the case
-// above, and the reason the dispatch-time resolve is a preference rather than
-// a verdict. A SCOPE_CONFIG can land in ANY ring, and DrainInto walks rings
-// 0..n-1: here the config that was in force (ktime tK, shift 4) sits in ring
-// 3 while the MSG_FLOW it covers (ktime tK+5) sits in ring 0, so at dispatch
-// time nothing is latched yet. The record must still be scaled by that older
-// config -- resolving only at dispatch would charge a whole poll window of
-// receive samples to msgFlowScaleSkipped for no reason, including on the very
-// first config after activation.
 func TestMsgFlowScaledByConfigFromALaterRing(t *testing.T) {
 	d, mock := msgFlowRig(t, 4, []msgFlowCfg{
 		{ring: 3, ktime: tK, payloadLen: 48, recvShift: 4},
@@ -211,16 +208,6 @@ func TestMsgFlowScaledByConfigFromALaterRing(t *testing.T) {
 	}
 }
 
-// TestMsgFlowHeldRecordKeepsArrivalShift is FIX-B4(b): a MSG_FLOW parked
-// awaiting its PROC_META is converted later, and the config can change inside
-// that window. The shift is resolved and latched when the record is
-// DISPATCHED, so the released sample carries the shift that was in force when
-// it arrived rather than being re-resolved at release time.
-//
-// Two config changes land inside the settling window on purpose: that is what
-// makes the latching load-bearing rather than incidental. Re-resolving at
-// release time would by then find only those two configs retained -- both
-// newer than the record -- and skip the sample outright, silently losing it.
 func TestMsgFlowHeldRecordKeepsArrivalShift(t *testing.T) {
 	f := newFixture(t, 1, 4096)
 	f.mustWrite(t, 0, msgFlowCfg{ktime: tK, payloadLen: 48, recvShift: 4}.enc())
@@ -259,8 +246,8 @@ func TestMsgFlowHeldRecordKeepsArrivalShift(t *testing.T) {
 		t.Fatalf("reported %d traces after release, want 1", len(mock.traces))
 	}
 	m := mock.metas[0]
-	if m.ValueKind != samples.ValueKindMsgs {
-		t.Fatalf("ValueKind = %d, want ValueKindMsgs", m.ValueKind)
+	if samples.BeamScopeValueKind(m.ProfileType) != samples.ValueKindMsgs {
+		t.Fatalf("ValueKind = %d, want ValueKindMsgs", samples.BeamScopeValueKind(m.ProfileType))
 	}
 	if m.Value != int64(9<<4) {
 		t.Fatalf("Value = %d, want %d (9 << 4, the shift in force when the "+
@@ -273,11 +260,6 @@ func TestMsgFlowHeldRecordKeepsArrivalShift(t *testing.T) {
 	}
 }
 
-// TestMsgFlowScaleSkippedSurfacedInDrainStats: the skip counter must not be
-// a white-box-only signal. A whole sample class silently failing to
-// synthesize (stale/missing SCOPE_CONFIG) has to be visible in the same
-// drain_stats JSONL line that already surfaces heldEvicted, for the same
-// reason -- otherwise it is invisible in production.
 func TestMsgFlowScaleSkippedSurfacedInDrainStats(t *testing.T) {
 	// No SCOPE_CONFIG at all: every MSG_FLOW is skipped.
 	d, _ := msgFlowRig(t, 1, nil, 0, tK, 9)

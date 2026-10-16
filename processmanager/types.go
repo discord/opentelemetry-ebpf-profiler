@@ -61,7 +61,8 @@ func kernelFrameCacheKey(address libpf.Address, generation kallsyms.Generation) 
 // process.
 type ProcessManager struct {
 	// A mutex to synchronize access to internal data within this struct.
-	mu sync.RWMutex
+	mu     sync.RWMutex
+	closed bool
 
 	// interpreterTracerEnabled indicates if at last one non-native tracer is loaded.
 	interpreterTracerEnabled bool

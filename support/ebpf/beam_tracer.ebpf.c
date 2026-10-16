@@ -31,19 +31,8 @@ struct beam_bif_processes_t {
 } beam_bif_processes SEC(".maps");
 #endif
 
-// beam_sched_tids maps a kernel tid to the ErtsSchedulerData of the BEAM
-// scheduler thread it is, for per-sample Erlang process attribution
-// (beam_sched.h). Keyed by tid rather than pid because attribution is
-// per-thread; sized for the schedulers of every BEAM on the host (a 128-core
-// box running four VMs at +S 128 needs ~512 normal plus dirty).
-//
-// Unlike beam_procs this map is loaded unconditionally, because collect_trace
-// reads it and collect_trace is inlined into native_tracer_entry, which is
-// always loaded -- a map that only exists when `-tracers beam` is set would
-// make the always-loaded program fail to resolve. BPF_F_NO_PREALLOC keeps
-// that unconditional presence nearly free on the vast majority of hosts,
-// where it stays empty; it is only ever updated from user space, so the
-// non-preallocated allocation path is never taken from a sampling context.
+// Sampling entry points reference this map even when BEAM unwinding is disabled.
+// NO_PREALLOC keeps the empty map cheap; only user space inserts scheduler TIDs.
 struct beam_sched_tids_t {
   __uint(type, BPF_MAP_TYPE_HASH);
   __type(key, u32);

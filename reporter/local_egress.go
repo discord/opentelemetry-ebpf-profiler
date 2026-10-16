@@ -3,40 +3,21 @@
 
 package reporter // import "go.opentelemetry.io/ebpf-profiler/reporter"
 
-// LocalEgressReporter is a Discord addition: the local egress path, which keeps
-// every sample on this host instead of shipping OTLP to a collection agent. It
-// has two INDEPENDENT backends, either or both of which can be enabled:
-//
-//   - the pprof-file sink (pprof_file_reporter.go), an archive to be sliced and
-//     diffed after the fact;
-//   - the socket sink (socket_sink.go), a live stream for a consumer that needs
-//     sub-flush-interval resolution.
-//
-// The structure that matters is that the per-sample DECODE happens once, here,
-// and both sinks receive the same assembled *sampleEvent:
-//
-//   - frames flattened out of the tracer's interned tables, so nothing keeps
-//     those caches alive and both sinks see identical stacks;
-//   - lineage resolved on the REPORTING path, not at flush time, because by
-//     flush time a short-lived process is gone and its lineage with it;
-//   - the keep filters and the comm trim applied before either sink sees the
-//     sample, so "what was recorded" cannot differ between them.
-//
-// One decode means the two artifacts are structurally identical rather than
-// merely intended to agree: there is no second decode to drift. Neither sink
-// knows the other's type -- the socket sink used to be a field inside the pprof
-// reporter, which is why the socket could not run without pprof files.
+// Local egress assembles each sample once and sends the same immutable event
+// to the enabled pprof and socket backends. Lineage is resolved on receipt
+// while short-lived processes may still exist.
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
 // LocalEgressConfig configures the local egress. At least one backend must be
@@ -78,6 +59,8 @@ type LocalEgressConfig struct {
 // LocalEgressReporter implements Reporter by fanning each assembled sample out
 // to the enabled local backends.
 type LocalEgressReporter struct {
+	mu        sync.RWMutex
+	stopped   bool
 	assembler sampleAssembler
 
 	// pprof is nil unless cfg.Dir was set, socket nil unless
@@ -116,9 +99,10 @@ func NewLocalEgress(cfg LocalEgressConfig) (*LocalEgressReporter, error) {
 	}
 	if cfg.Socket.Path != "" {
 		sockCfg := cfg.Socket
-		if sockCfg.SamplesPerSecond == 0 {
-			sockCfg.SamplesPerSecond = cfg.SamplesPerSecond
+		if sockCfg.SamplesPerSecond != 0 && sockCfg.SamplesPerSecond != cfg.SamplesPerSecond {
+			return nil, fmt.Errorf("socket sample rate %d differs from reporter rate %d", sockCfg.SamplesPerSecond, cfg.SamplesPerSecond)
 		}
+		sockCfg.SamplesPerSecond = cfg.SamplesPerSecond
 		sink, err := newSocketSink(sockCfg)
 		if err != nil {
 			return nil, err
@@ -126,12 +110,7 @@ func NewLocalEgress(cfg LocalEgressConfig) (*LocalEgressReporter, error) {
 		r.socket = sink
 	}
 	if r.pprof != nil && r.socket != nil {
-		// Cross-attestation is only meaningful when both backends are running:
-		// the archive states the stream's loss so the two artifacts cannot
-		// disagree about the same run. With one backend there is nothing to
-		// attest to -- a socket-only run's loss lives in its STATS records and
-		// in the loss warning, and a pprof-only run has no stream to lose
-		// anything.
+		// Include socket loss counters in profiles when both outputs are enabled.
 		r.pprof.crossAttest = r.socket.dropSummaryIfLossy
 	}
 	return r, nil
@@ -140,6 +119,11 @@ func NewLocalEgress(cfg LocalEgressConfig) (*LocalEgressReporter, error) {
 // ReportTraceEvent assembles one sample and hands it to every enabled backend.
 func (r *LocalEgressReporter) ReportTraceEvent(trace *libpf.Trace,
 	meta *samples.TraceEventMeta) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.stopped {
+		return errors.New("local egress is stopped")
+	}
 	ev, err := r.assembler.assemble(trace, meta)
 	if err != nil || ev == nil {
 		return err
@@ -159,6 +143,11 @@ func (r *LocalEgressReporter) ReportTraceEvent(trace *libpf.Trace,
 
 // Start begins whatever background work the enabled backends need.
 func (r *LocalEgressReporter) Start(ctx context.Context) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.stopped {
+		return errors.New("local egress is stopped")
+	}
 	if r.socket != nil {
 		r.socket.start()
 	}
@@ -168,18 +157,15 @@ func (r *LocalEgressReporter) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop shuts the enabled backends down.
-//
-// The socket sink is shut down FIRST, before the pprof sink's final flush. Its
-// drain is where the socket path's loss is finally accounted -- a consumer that
-// has gone away is discovered there, and that is where the write buffer is
-// discarded and the ring charged to droppedNoSock -- so draining afterwards put
-// every one of those drops after the last pprof file was written. The archive
-// then stated "no loss" for a run whose log warned about loss, which is exactly
-// the cross-attestation the comment claims to provide. Both backends already
-// received every event at ReportTraceEvent time, so the reordering costs the
-// socket nothing.
+// Stop drains the socket before the final profile flush so that the profile
+// includes the socket's final loss counters.
 func (r *LocalEgressReporter) Stop() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.stopped {
+		return
+	}
+	r.stopped = true
 	if r.socket != nil {
 		r.socket.shutdown()
 	}
@@ -198,8 +184,8 @@ func (r *LocalEgressReporter) Flush() error {
 	return r.pprof.Flush()
 }
 
-// Dropped reports how many samples the pprof sink discarded for exceeding its
-// buffer, zero when that backend is disabled.
+// Dropped returns samples lost to a full buffer or a failed profile write,
+// or zero when the pprof backend is disabled.
 func (r *LocalEgressReporter) Dropped() uint64 {
 	if r.pprof == nil {
 		return 0
@@ -207,12 +193,7 @@ func (r *LocalEgressReporter) Dropped() uint64 {
 	return r.pprof.dropped.Load()
 }
 
-// SocketDropped reports how many samples the socket egress discarded, zero when
-// that backend is disabled. A silently lossy profiler is worse than a dead one,
-// so socket loss is surfaced in every combination: here, in every STATS record
-// on the wire, in the loss warning, and -- when the pprof backend is also
-// enabled -- in the pprof file's comments, so the archive and the stream
-// cross-attest.
+// SocketDropped returns socket losses, or zero when that backend is disabled.
 func (r *LocalEgressReporter) SocketDropped() uint64 {
 	if r.socket == nil {
 		return 0
@@ -233,21 +214,17 @@ type sampleAssembler struct {
 // knows how to render.
 func (a *sampleAssembler) assemble(trace *libpf.Trace,
 	meta *samples.TraceEventMeta) (*sampleEvent, error) {
-	if _, ok := originTable[meta.Origin]; !ok {
-		return nil, fmt.Errorf("skip reporting trace for %d origin: %w",
-			meta.Origin, errUnknownOrigin)
+	origin := profileOrigin(meta.ProfileType)
+	if origin == originUnknown {
+		return nil, fmt.Errorf("unsupported profile type %v: %w", meta.ProfileType, errUnknownProfileType)
 	}
 	if len(a.keepPIDs) > 0 {
 		if _, ok := a.keepPIDs[meta.PID]; !ok {
 			return nil, nil
 		}
 	}
-	// The kernel's comm for a BEAM main thread genuinely contains the trailing
-	// newline ("beam.smp\n"); threads the VM renamed via pthread_setname_np
-	// ("1_scheduler") do not, so the problem shows up on exactly one thread per
-	// VM. Untrimmed, that makes one process look like two when grouped on the
-	// label, AND makes a `-keep-comms beam.smp` filter silently match nothing
-	// for the main thread -- so trim once, before the filter.
+	// Normalize the trailing newline in the BEAM main thread's comm before
+	// filtering or writing labels.
 	comm := strings.TrimSpace(meta.Comm.String())
 	if len(a.keepComms) > 0 {
 		if _, ok := a.keepComms[comm]; !ok {
@@ -261,27 +238,28 @@ func (a *sampleAssembler) assemble(trace *libpf.Trace,
 	lin := a.lineage.get(int(meta.PID))
 
 	ev := &sampleEvent{
-		frames:       flatten(trace.Frames),
-		ppid:         lin.ppid,
-		ancestry:     lin.ancestryLabel(),
-		ktime:        meta.KTime,
-		unixNano:     int64(meta.Timestamp),
-		pid:          meta.PID,
-		tid:          meta.TID,
-		cpu:          meta.CPU,
-		offTime:      meta.OffTime,
-		origin:       meta.Origin,
+		frames:   flatten(trace.Frames),
+		ppid:     lin.ppid,
+		ancestry: lin.ancestryLabel(),
+		ktime:    meta.KTime,
+		unixNano: int64(meta.Timestamp),
+		pid:      meta.PID,
+		tid:      meta.TID,
+		cpu:      int(meta.CPU),
+
+		origin:       origin,
 		value:        meta.Value,
-		valueKind:    meta.ValueKind,
+		valueKind:    samples.BeamScopeValueKind(meta.ProfileType),
 		erlangPidKey: meta.ErlangPidKey,
 		comm:         comm, // trimmed above, before KeepComms
 		processName:  strings.TrimSpace(meta.ProcessName.String()),
 		executable:   meta.ExecutablePath.String(),
 		containerID:  meta.ContainerID.String(),
 	}
-	// Discord: custom labels ride every origin (un-gate; needs
-	// them off beamscope too). Today only beamscope populates any
-	// (erlang_pid, bin_vheap_delta, beamscope_kind, ...).
+	if origin == originOffCPU {
+		ev.offTime = meta.Value
+	}
+	// Copy labels because the tracer may reuse them after this call.
 	if len(trace.CustomLabels) > 0 {
 		ev.labels = make(map[string]string, len(trace.CustomLabels))
 		for k, v := range trace.CustomLabels {
@@ -301,7 +279,7 @@ type sampleEvent struct {
 	pid, tid    libpf.PID
 	cpu         int
 	offTime     int64
-	origin      libpf.Origin
+	origin      sampleOrigin
 	ppid        int
 	ancestry    string
 	comm        string
@@ -318,8 +296,7 @@ type sampleEvent struct {
 	// attribution: the raw pid Eterm, or 0 when the sample is not
 	// attributable. Zero means "no label", never "pid 0".
 	erlangPidKey uint64
-	// labels carries trace custom labels for every origin (un-gate;
-	// beamscope populates erlang_pid, bin_vheap_delta, beamscope_kind, ...).
+	// labels contains a snapshot of the trace custom labels.
 	labels map[string]string
 }
 
@@ -353,33 +330,26 @@ func flatten(frames libpf.Frames) []frame {
 	return out
 }
 
-// originTable is the single enumeration of the origins the local egress
-// accepts. It answers all three questions that used to be three hand-maintained
-// switches: is the origin valid at all (assemble), what does the pprof `origin`
-// label say (originName), and what byte goes on the socket wire (socketOrigin,
-// socket_sink.go). Adding an origin here cannot leave one of the three behind.
-//
-// The value-column fill rule is deliberately NOT here: it is frozen, and its
-// default arm exists precisely so that a newly added origin is noticed.
-var originTable = map[libpf.Origin]struct {
+// originTable maps local profile classifications to labels and wire codes.
+var originTable = map[sampleOrigin]struct {
 	name string
 	wire uint8
 }{
-	support.TraceOriginSampling: {"sampling", socketOriginSampling},
-	support.TraceOriginOffCPU:   {"off_cpu", socketOriginOffCPU},
-	support.TraceOriginProbe:    {"probe", socketOriginProbe},
+	originSampling: {"sampling", socketOriginSampling},
+	originOffCPU:   {"off_cpu", socketOriginOffCPU},
+	originProbe:    {"probe", socketOriginProbe},
 	// Discord: BEAM shm instrumentation.
-	support.TraceOriginBeamScope: {"beamscope", socketOriginBeamScope},
+	originBeamScope: {"beamscope", socketOriginBeamScope},
 }
 
-func originName(o libpf.Origin) string {
+func originName(o sampleOrigin) string {
 	if info, ok := originTable[o]; ok {
 		return info.name
 	}
 	return fmt.Sprintf("origin_%d", o)
 }
 
-// ParsePIDList turns a comma-separated PID list into a set.
+// ParsePIDList turns a PID slice into a set.
 func ParsePIDList(pids []int) map[libpf.PID]struct{} {
 	if len(pids) == 0 {
 		return nil
@@ -407,4 +377,34 @@ func ParseCommList(comms []string) map[string]struct{} {
 		return nil
 	}
 	return out
+}
+
+// sampleOrigin is the local file/socket classification, independent of kernel origin IDs.
+type sampleOrigin uint8
+
+const (
+	originUnknown sampleOrigin = iota
+	originSampling
+	originOffCPU
+	originProbe
+	originBeamScope
+)
+
+func profileOrigin(p *samples.TypeMetadata) sampleOrigin {
+	if p == nil {
+		return originUnknown
+	}
+	if samples.BeamScopeValueKind(p) != samples.ValueKindNone {
+		return originBeamScope
+	}
+	switch {
+	case p.PeriodType == "cpu" && p.PeriodUnit == "nanoseconds" && p.SampleType == "samples" && p.SampleUnit == "count":
+		return originSampling
+	case p.SampleType == "off_cpu" && p.SampleUnit == "nanoseconds" && p.ReportValues:
+		return originOffCPU
+	case p.SampleType == "events" && p.SampleUnit == "count":
+		return originProbe
+	default:
+		return originUnknown
+	}
 }

@@ -120,7 +120,9 @@ func (sp *systemProcess) GetProcessMeta(enrichers []MetaEnricher) Meta {
 		log.Debugf("Failed extracting containerID for %d: %v", sp.pid, err)
 	}
 
+	name, _ := os.ReadFile(filepath.Join(sp.procBase, "comm"))
 	pMeta := Meta{
+		Name:        libpf.Intern(strings.TrimSpace(string(name))),
 		Executable:  exePath,
 		ContainerID: containerID,
 	}

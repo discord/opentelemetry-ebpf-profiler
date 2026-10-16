@@ -8,6 +8,7 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/interpreter"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/apmint"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/beam"
+	"go.opentelemetry.io/ebpf-profiler/interpreter/beamscope"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/dotnet"
 	golang "go.opentelemetry.io/ebpf-profiler/interpreter/go"
 	"go.opentelemetry.io/ebpf-profiler/interpreter/hotspot"
@@ -93,6 +94,9 @@ func (cfg *Config) Loaders() []interpreter.Loader {
 	}
 	if !cfg.ThreadContext.IsDisabled() {
 		loaders = append(loaders, threadcontext.GetLoader(cfg.ThreadContext))
+	}
+	if beamscope.Enabled() {
+		loaders = append(loaders, interpreter.NewLoader(beamscope.Loader, nil))
 	}
 	return loaders
 }

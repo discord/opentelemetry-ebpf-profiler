@@ -1,19 +1,8 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// Discord addition. The two beamscope egress sinks:
-//
-//   - reporterSink turns GC_DELTA/GC_DELTA2/SCHED_DELTA/MSG_FLOW records into
-//     single-frame BEAM traces on the existing Reporter.ReportTraceEvent seam
-//     with origin TraceOriginBeamScope. The frame is the process's
-//     initial_call (from cached PROC_META), the sample value rides
-//     meta.Value/meta.ValueKind (alloc_words, on-scheduler ns, or scaled
-//     message arrivals -- see samples.ValueKind*), and erlang_pid plus
-//     kind-specific extras ride as custom labels. meta.OffTime is NOT used
-//     here any more: it is exclusively the off-CPU sample's value.
-//   - jsonlSink appends every non-GC record as one JSON object per line to a
-//     per-PID file, snake_case fields mirroring the ABI names, ktime_ns and
-//     unix_ns always present.
+// Convert allocation, scheduler and message records into reporter samples;
+// write the remaining runtime records to an optional per-PID JSONL file.
 package beamscope // import "go.opentelemetry.io/ebpf-profiler/interpreter/beamscope"
 
 import (
@@ -37,7 +26,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/process"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
 )
 
 // Custom label keys attached to beamscope samples. Renaming any of them is a
@@ -69,7 +57,7 @@ type reporterSink struct {
 	pid libpf.PID
 
 	mu       sync.Mutex
-	procMeta process.ProcessMeta
+	procMeta process.Meta
 
 	// metaCache holds pid_key -> PROC_META, fed by the lazily emitted
 	// metadata records (ABI: first reference per epoch). Only touched from the
@@ -90,7 +78,7 @@ func newReporterSink(rep reporter.TraceReporter, pid libpf.PID) *reporterSink {
 }
 
 // setProcessMeta installs the /proc-derived identity used on every sample.
-func (s *reporterSink) setProcessMeta(pm process.ProcessMeta) {
+func (s *reporterSink) setProcessMeta(pm process.Meta) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.procMeta = pm
@@ -108,7 +96,7 @@ func (s *reporterSink) hasMeta(pidKey uint64) bool {
 	return ok
 }
 
-// evictMeta drops a cached PROC_META (PROC_EXIT eviction; see FIX-6): without
+// evictMeta drops a cached PROC_META (PROC_EXIT eviction): without
 // it the cache leaks one entry per exited pid under process churn. Only
 // touched from the drain goroutine, like the cache itself.
 func (s *reporterSink) evictMeta(pidKey uint64) {
@@ -168,8 +156,9 @@ func (s *reporterSink) reportSample(hdr *RecordHeader, pidKey uint64,
 
 	var frames libpf.Frames
 	frames.Append(&libpf.Frame{
-		Type:         libpf.BEAMFrame,
-		FunctionName: libpf.Intern(name),
+		Type:            libpf.BEAMFrame,
+		FunctionName:    libpf.Intern(name),
+		AddressOrLineno: beamFrameID(uint64(s.pid), pidKey, kind.String()+"\x00"+name),
 	})
 
 	labels[labelBeamscopeKind] = kind
@@ -179,7 +168,6 @@ func (s *reporterSink) reportSample(hdr *RecordHeader, pidKey uint64,
 
 	trace := &libpf.Trace{
 		Frames:       frames,
-		Hash:         beamTraceHash(uint64(s.pid), pidKey, kind.String()+"\x00"+name),
 		CustomLabels: labels,
 	}
 
@@ -190,15 +178,15 @@ func (s *reporterSink) reportSample(hdr *RecordHeader, pidKey uint64,
 	meta := &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(hdr.UnixNS),
 		KTime:          int64(hdr.KTimeNS),
-		Comm:           pm.Name,
+		Comm:           libpf.NewCommFromString(pm.Name.String()),
 		ProcessName:    pm.Name,
 		ExecutablePath: pm.Executable,
 		ContainerID:    pm.ContainerID,
 		PID:            s.pid,
+		ErlangPidKey:   pidKey,
 		TID:            s.pid,
-		Origin:         support.TraceOriginBeamScope,
+		ProfileType:    samples.BeamScopeProfile(valueKind),
 		Value:          value,
-		ValueKind:      valueKind,
 	}
 
 	if err := s.rep.ReportTraceEvent(trace, meta); err != nil {
@@ -215,26 +203,15 @@ func fmtU64(v uint64) libpf.String { return libpf.Intern(strconv.FormatUint(v, 1
 // handleGCDelta synthesizes one sample per GC_DELTA (0x01) record. Kept as-is
 // for old captures: value = alloc_words, label bin_vheap_delta.
 func (s *reporterSink) handleGCDelta(r *GCDelta) {
-	s.reportSample(&r.RecordHeader, r.PidKey, int64(r.AllocWords), kindAlloc,
+	s.reportSample(&r.RecordHeader, r.PidKey, scaleArrivals(r.AllocWords, 0), kindAlloc,
 		samples.ValueKindAlloc,
 		map[libpf.String]libpf.String{
 			labelBinVheapDelta: fmtU64(r.BinVheapDeltaWords),
 		})
 }
 
-// handleGCDelta2 synthesizes one sample per GC_DELTA2 (0x08) record: the 0x01
-// shape plus mbuf_words and pause_ns.
-//
-// When the record carries NO_START the writer never saw the matching
-// gc_start, so it zero-filled pause_ns and mbuf_words. Emitting those as num
-// labels would be a plausible-looking lie -- a 0 ns pause is indistinguishable
-// from a genuinely fast GC once it is averaged into pause statistics -- so
-// they are OMITTED for that sample, the same discipline handleSchedDelta
-// applies to preempts/yields. alloc_words (the sample VALUE) and
-// bin_vheap_delta are measured either way and always emitted. The label
-// contract is unchanged: no key is added or renamed, an unmeasured one is
-// simply absent. gc_kind is not a label here and reaches no sink, so there is
-// nothing to suppress for it beyond the struct's own documentation.
+// handleGCDelta2 emits allocation deltas and GC details. NO_START records
+// carry no valid pause, mbuf or GC-kind measurement, so omit those labels.
 func (s *reporterSink) handleGCDelta2(r *GCDelta2) {
 	labels := map[libpf.String]libpf.String{
 		labelBinVheapDelta: fmtU64(r.BinVheapDeltaWords),
@@ -243,12 +220,12 @@ func (s *reporterSink) handleGCDelta2(r *GCDelta2) {
 		labels[labelMbufWords] = fmtU64(r.MbufWords)
 		labels[labelPauseNS] = fmtU64(r.PauseNS)
 	}
-	s.reportSample(&r.RecordHeader, r.PidKey, int64(r.AllocWords), kindAlloc,
+	s.reportSample(&r.RecordHeader, r.PidKey, scaleArrivals(r.AllocWords, 0), kindAlloc,
 		samples.ValueKindAlloc, labels)
 }
 
 // handleSchedDelta synthesizes one sample per SCHED_DELTA (0x0A) record:
-// value = on_sched_ns (semantically correct for the cpu/nanoseconds slot).
+// value = on_sched_ns.
 // preempts/yields are omitted when the writer cannot classify.
 func (s *reporterSink) handleSchedDelta(r *SchedDelta) {
 	labels := map[libpf.String]libpf.String{
@@ -258,34 +235,25 @@ func (s *reporterSink) handleSchedDelta(r *SchedDelta) {
 		labels[labelPreempts] = fmtU64(uint64(r.Preempts))
 		labels[labelYields] = fmtU64(uint64(r.Yields))
 	}
-	s.reportSample(&r.RecordHeader, r.PidKey, int64(r.OnSchedNS), kindSched,
+	s.reportSample(&r.RecordHeader, r.PidKey, scaleArrivals(r.OnSchedNS, 0), kindSched,
 		samples.ValueKindSchedNS, labels)
 }
 
-// handleMsgFlow synthesizes one sample per MSG_FLOW (0x0D) record. value is
-// the caller-precomputed scaled arrival estimate: the drainer resolves the
-// RecvSampleShift in force when the record was written (this sink has no
-// access to the ScopeConfig state, which lives on the drainer) and only
-// calls here when a config can support scaling. No kind-specific extras
-// beyond the standard erlang_pid/beamscope_kind pair.
+// handleMsgFlow emits a message-arrival count already scaled by the drainer.
 func (s *reporterSink) handleMsgFlow(r *MsgFlow, value int64) {
 	s.reportSample(&r.RecordHeader, r.PidKey, value, kindMsg,
 		samples.ValueKindMsgs, map[libpf.String]libpf.String{})
 }
 
-// beamTraceHash builds a stable trace hash for the synthesized single-frame
-// stack. It must differ whenever the rendered stack differs, or downstream
-// dedup would merge distinct stacks.
-func beamTraceHash(osPid, pidKey uint64, name string) libpf.TraceHash {
-	h := fnv.New128a()
+// beamFrameID gives synthetic frames a stable address for Trace.Hash().
+func beamFrameID(osPid, pidKey uint64, name string) libpf.AddressOrLineno {
+	h := fnv.New64a()
 	var b [16]byte
 	binary.LittleEndian.PutUint64(b[0:], osPid)
 	binary.LittleEndian.PutUint64(b[8:], pidKey)
 	_, _ = h.Write(b[:])
 	_, _ = h.Write([]byte(name))
-	sum := h.Sum(nil)
-	return libpf.NewTraceHash(binary.BigEndian.Uint64(sum[0:8]),
-		binary.BigEndian.Uint64(sum[8:16]))
+	return libpf.AddressOrLineno(h.Sum64())
 }
 
 // jsonlSink appends records as JSON lines to <dir>/beamscope-<pid>.jsonl.
@@ -404,12 +372,7 @@ type drainStatsLine struct {
 	// hit its cap (evicted samples are still reported, with fallback naming).
 	HeldRecords int    `json:"held_records"`
 	HeldEvicted uint64 `json:"held_evicted_total"`
-	// MsgFlowScaleSkipped is the running count of MSG_FLOW records for which
-	// no pprof sample was synthesized because no retained SCOPE_CONFIG that
-	// predates the record could support scaling (see
-	// drainer.resolveRecvShift). Otherwise
-	// unobservable outside a white-box test, same reasoning as HeldEvicted
-	// above.
+	// MsgFlowScaleSkipped counts records with no usable receive-sampling config.
 	MsgFlowScaleSkipped uint64 `json:"msg_flow_scale_skipped_total"`
 }
 

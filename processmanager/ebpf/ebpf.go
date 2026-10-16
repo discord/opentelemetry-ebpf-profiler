@@ -56,8 +56,8 @@ type ebpfMapsImpl struct {
 	RubyProcs          *cebpf.Map `name:"ruby_procs"`
 	V8Procs            *cebpf.Map `name:"v8_procs"`
 	BeamProcs          *cebpf.Map `name:"beam_procs"`
-	BeamSchedTids *cebpf.Map `name:"beam_sched_tids"`
- LuaJitProcs        *cebpf.Map `name:"luajit_procs"`
+	BeamSchedTids      *cebpf.Map `name:"beam_sched_tids"`
+	LuaJitProcs        *cebpf.Map `name:"luajit_procs"`
 	ApmIntProcs        *cebpf.Map `name:"apm_int_procs"`
 	GoProcs            *cebpf.Map `name:"go_procs"`
 	ThreadContextProcs *cebpf.Map `name:"thread_context_procs"`
@@ -233,7 +233,7 @@ func (impl *ebpfMapsImpl) DeleteProcData(typ libpf.InterpreterType, pid libpf.PI
 // enables per-sample Erlang process attribution for that kernel tid.
 func (impl *ebpfMapsImpl) UpdateBeamSchedTid(tid libpf.PID, info support.BeamSchedInfo) error {
 	if impl.BeamSchedTids == nil {
-		// The map is loaded unconditionally (see types.IsMapEnabled), so this
+		// The map is loaded unconditionally (see interpreterconfig.IsMapEnabled), so this
 		// is unreachable in the agent; it keeps a nil deref from taking the
 		// whole process down over an optional label if that ever changes.
 		return fmt.Errorf("beam_sched_tids map is not loaded")

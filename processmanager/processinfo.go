@@ -206,6 +206,9 @@ func (pm *ProcessManager) handleNewInterpreter(pr process.Process, bias libpf.Ad
 			return anonymousMappingsWanted, nil
 		}
 	}
+	if pm.closed {
+		return anonymousMappingsWanted, nil
+	}
 	// Slow path: Interpreter detection or attachment needed
 	instance, err := data.Attach(pm.ebpf, pid, bias, pr.GetRemoteMemory())
 	if err != nil {

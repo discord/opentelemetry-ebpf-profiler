@@ -49,8 +49,6 @@ func TestLineageResolvesChainRootFirst(t *testing.T) {
 	assert.Zero(t, c.Unresolved())
 }
 
-// A comm containing spaces and parentheses is the classic /proc/stat parsing
-// trap: splitting the line on whitespace puts the wrong field in ppid.
 func TestLineageParsesAwkwardComm(t *testing.T) {
 	root := fakeProcFS(t, map[int]int{1: 0, 42: 1},
 		map[int]string{42: "weird (name) with spaces"})
@@ -60,8 +58,6 @@ func TestLineageParsesAwkwardComm(t *testing.T) {
 	assert.Equal(t, 1, l.ppid)
 }
 
-// A process that died before we looked has no lineage, and that has to be
-// counted rather than silently rendered as "child of nothing".
 func TestLineageCountsUnresolved(t *testing.T) {
 	c := newLineageCache(t.TempDir())
 	l := c.get(9999)
@@ -74,7 +70,6 @@ func TestLineageCountsUnresolved(t *testing.T) {
 	assert.Equal(t, uint64(1), c.Unresolved())
 }
 
-// A cycle from pid reuse must terminate, and so must a very deep tree.
 func TestLineageBoundsTheWalk(t *testing.T) {
 	tree := map[int]int{}
 	for pid := 2; pid <= 200; pid++ {
@@ -93,7 +88,6 @@ func TestLineageBoundsTheWalk(t *testing.T) {
 	assert.Equal(t, 7, got.ppid)
 }
 
-// The labels have to reach the file, or a descendant filter has nothing to match.
 func TestPprofFileReporterWritesLineageLabels(t *testing.T) {
 	root := fakeProcFS(t, map[int]int{1: 0, 100: 1, 200: 100}, nil)
 	dir := t.TempDir()
@@ -109,8 +103,6 @@ func TestPprofFileReporterWritesLineageLabels(t *testing.T) {
 	assert.Equal(t, []string{"1/100"}, p.Sample[0].Label[LabelAncestry])
 }
 
-// Unresolvable lineage is reported in the profile, so a reader can weigh an
-// ancestry-based number instead of trusting it blindly.
 func TestPprofFileReporterReportsUnresolvedLineage(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100, ProcFS: t.TempDir()})

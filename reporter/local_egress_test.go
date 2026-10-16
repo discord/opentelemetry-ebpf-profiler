@@ -13,11 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The four combinations of the two local backends. They used to be three --
-// socket-only was rejected at startup, because the socket sink was a field
-// inside the pprof reporter and read its already-decoded sampleEvent. The decode
-// now happens in the assembler, above both sinks, so each backend stands alone.
-
 // waitForEmitted blocks until the socket sink has delivered n samples. Reports
 // with no pprof Flush between them and Stop() otherwise race the writer
 // goroutine's first dial: run() picks between a ready stop channel and a ready
@@ -34,10 +29,6 @@ func waitForEmitted(t *testing.T, s *socketSink, n uint64) {
 	}
 }
 
-// Neither backend is a configuration error, not a silent no-op: a local egress
-// that records nothing while looking like a reporter is the failure mode the
-// whole design is meant to make impossible. Nothing is created and nothing is
-// dialed, because nothing is constructed.
 func TestLocalEgressRequiresAtLeastOneBackend(t *testing.T) {
 	r, err := NewLocalEgress(LocalEgressConfig{SamplesPerSecond: 997})
 	require.Error(t, err)
@@ -45,8 +36,6 @@ func TestLocalEgressRequiresAtLeastOneBackend(t *testing.T) {
 	assert.Contains(t, err.Error(), "at least one backend")
 }
 
-// pprof only: files are written, and the socket is never dialed -- there is no
-// socket sink at all, so nothing can reference one.
 func TestLocalEgressPprofOnlyNeverTouchesTheSocket(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{
@@ -58,7 +47,7 @@ func TestLocalEgressPprofOnlyNeverTouchesTheSocket(t *testing.T) {
 	require.NoError(t, r.Start(t.Context()))
 
 	tr := testTrace(t, "root", "leaf")
-	for i := int64(0); i < 10; i++ {
+	for i := range int64(10) {
 		require.NoError(t, r.ReportTraceEvent(tr, meta(i, 100, 101, "c", "p", "x")))
 	}
 	require.NoError(t, r.Flush())
@@ -73,8 +62,6 @@ func TestLocalEgressPprofOnlyNeverTouchesTheSocket(t *testing.T) {
 		"cross-attestation is meaningless with one backend")
 }
 
-// socket only: records reach the consumer, and NO pprof file is produced. This
-// is the combination that could not be expressed before.
 func TestLocalEgressSocketOnlyWritesNoPprofFile(t *testing.T) {
 	l := newListener(t)
 	r, err := NewLocalEgress(LocalEgressConfig{
@@ -88,7 +75,7 @@ func TestLocalEgressSocketOnlyWritesNoPprofFile(t *testing.T) {
 
 	tr := testTrace(t, "root", "mid", "leaf")
 	const n = 20
-	for i := int64(0); i < n; i++ {
+	for i := range int64(n) {
 		require.NoError(t, r.ReportTraceEvent(tr,
 			meta(5_000+i, 100, 101, "1_scheduler", "beam.smp", "cafe01")))
 	}
@@ -115,9 +102,6 @@ func TestLocalEgressSocketOnlyWritesNoPprofFile(t *testing.T) {
 	assert.NotNil(t, r.assembler.lineage)
 }
 
-// socket only, lossy: the loss signal must survive the absence of a pprof
-// archive. With no file to carry a comment, STATS on the wire and Dropped() are
-// the whole story, so both have to be right.
 func TestLocalEgressSocketOnlyStillReportsLoss(t *testing.T) {
 	sock := filepath.Join(t.TempDir(), "absent.sock")
 	r, err := NewLocalEgress(LocalEgressConfig{
@@ -130,7 +114,7 @@ func TestLocalEgressSocketOnlyStillReportsLoss(t *testing.T) {
 	require.NoError(t, r.Start(t.Context()))
 	tr := testTrace(t, "root", "leaf")
 	const n = 500
-	for i := int64(0); i < n; i++ {
+	for i := range int64(n) {
 		require.NoError(t, r.ReportTraceEvent(tr, meta(i, 1, 2, "c", "p", "x")))
 	}
 	r.Stop()
@@ -148,9 +132,6 @@ func TestLocalEgressSocketOnlyStillReportsLoss(t *testing.T) {
 	assert.NotEmpty(t, sk.dropSummaryIfLossy())
 }
 
-// both: ONE ReportTraceEvent reaches both backends, and the two outputs agree
-// sample for sample. This is the fan-out property that used to be free (one
-// struct held both) and now has to be maintained deliberately.
 func TestLocalEgressBothBackendsSeeEveryEvent(t *testing.T) {
 	l := newListener(t)
 	dir := t.TempDir()
@@ -167,7 +148,7 @@ func TestLocalEgressBothBackendsSeeEveryEvent(t *testing.T) {
 
 	tr := testTrace(t, "root", "mid", "leaf")
 	const n = 32
-	for i := int64(0); i < n; i++ {
+	for i := range int64(n) {
 		require.NoError(t, r.ReportTraceEvent(tr,
 			meta(9_000+i, 100, 101, "1_scheduler", "beam.smp", "cafe01")))
 	}
@@ -201,12 +182,6 @@ func TestLocalEgressBothBackendsSeeEveryEvent(t *testing.T) {
 	}
 }
 
-// The two backends' budgets are INDEPENDENT: one sink's overflow must not cost
-// the other a single record. This is the property that used to be free (there
-// was one buffer) and is now only true because the fan-out in
-// ReportTraceEvent keeps the sinks ignorant of each other. It was asserted
-// nowhere -- re-coupling the sinks passed the whole suite -- so it is pinned in
-// both directions here.
 func TestLocalEgressBackendBudgetsAreIndependent(t *testing.T) {
 	// A pprof buffer that overflows almost immediately must not truncate the
 	// live stream a consumer is reading.
@@ -227,7 +202,7 @@ func TestLocalEgressBackendBudgetsAreIndependent(t *testing.T) {
 
 		tr := testTrace(t, "root", "mid", "leaf")
 		const n = 24
-		for i := int64(0); i < n; i++ {
+		for i := range int64(n) {
 			require.NoError(t, r.ReportTraceEvent(tr,
 				meta(7_000+i, 100, 101, "1_scheduler", "beam.smp", "cafe01")))
 		}
@@ -264,7 +239,7 @@ func TestLocalEgressBackendBudgetsAreIndependent(t *testing.T) {
 
 		tr := testTrace(t, "root", "leaf")
 		const n = 300
-		for i := int64(0); i < n; i++ {
+		for i := range int64(n) {
 			require.NoError(t, r.ReportTraceEvent(tr, meta(i, 1, 2, "c", "p", "x")))
 		}
 		r.Stop()

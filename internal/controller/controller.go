@@ -164,12 +164,12 @@ func (c *Controller) Shutdown() {
 			c.cancelFunc()
 		}
 
-		if c.reporter != nil {
-			c.reporter.Stop()
-		}
-
+		// Interpreter detach may emit final samples, so close the tracer first.
 		if c.tracer != nil {
 			c.tracer.Close()
+		}
+		if c.reporter != nil {
+			c.reporter.Stop()
 		}
 	})
 }

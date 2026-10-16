@@ -98,20 +98,6 @@ const (
 	HSTSIDSegMapMask      = C.HS_TSID_SEG_MAP_MASK
 )
 
-const (
-	// PerfMaxStackDepth is the bpf map data array length for BPF_MAP_TYPE_STACK_TRACE traces
-	PerfMaxStackDepth = C.PERF_MAX_STACK_DEPTH
-)
-
-const (
-	TraceOriginUnknown  = C.TRACE_UNKNOWN
-	TraceOriginSampling = C.TRACE_SAMPLING
-	TraceOriginOffCPU   = C.TRACE_OFF_CPU
-	TraceOriginProbe    = C.TRACE_PROBE
-	// Discord: user-space beamscope samples; see TRACE_BEAMSCOPE in types.h.
-	TraceOriginBeamScope = C.TRACE_BEAMSCOPE
-)
-
 type ApmSpanID C.ApmSpanID
 type ApmTraceID C.ApmTraceID
 type Event C.Event

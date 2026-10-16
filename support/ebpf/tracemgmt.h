@@ -532,7 +532,7 @@ static inline EBPF_INLINE PerCPURecord *get_pristine_per_cpu_record()
   trace->apm_trace_id.as_int.hi    = 0;
   trace->apm_trace_id.as_int.lo    = 0;
   trace->apm_transaction_id.as_int = 0;
- trace->erlang_pid_key = 0;
+  trace->erlang_pid_key            = 0;
 
   return record;
 }
@@ -1218,9 +1218,9 @@ static inline EBPF_INLINE int collect_trace(
   trace->tid    = tid;
   trace->ktime  = trace_timestamp;
   trace->value  = value;
- if (origin == origin_id_sampling) {
- beam_stamp_current_process(trace, pid, tid);
- }
+  if (origin == origin_id_sampling) {
+    beam_stamp_current_process(trace, pid, tid);
+  }
   if (bpf_get_current_comm(&(trace->comm), sizeof(trace->comm)) < 0) {
     increment_metric(metricID_ErrBPFCurrentComm);
   }

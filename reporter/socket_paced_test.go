@@ -13,24 +13,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestSocketEgressPaced drives the REAL reporter at a paced rate into a socket
-// somebody else is listening on, stamping each sample with the real
-// CLOCK_MONOTONIC. It exists so the Rust consumer can be measured against the
-// actual producer across a real unix socket, rather than against a Rust
-// re-encoding of the wire format.
-//
-// Environment:
-//
-//	PSTORE_PACED_SOCK   the unix socket to dial (required; the test skips without it)
-//	PSTORE_PACED_N      samples to emit (default 5000)
-//	PSTORE_PACED_HZ     samples per second (default 2500 -- the measured
-//	                    profiler rate is 2465/s, so this is slightly above real)
-//	PSTORE_PACED_RING   socket ring size (default 65536; shrink it to force drops)
-//	PSTORE_PACED_DEPTH  stack depth (default 12)
-//
-// It prints one summary line to stdout that the caller parses:
-//
-//	PACED produced=<n> dropped=<n> first_ktime=<ns> last_ktime=<ns> wall_ns=<n>
 func TestSocketEgressPaced(t *testing.T) {
 	sock := os.Getenv("PSTORE_PACED_SOCK")
 	if sock == "" {
@@ -68,7 +50,7 @@ func TestSocketEgressPaced(t *testing.T) {
 	period := time.Duration(int64(time.Second) / int64(hz))
 	start := time.Now()
 	var firstK, lastK int64
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := ktimeNs()
 		if i == 0 {
 			firstK = k
@@ -78,7 +60,7 @@ func TestSocketEgressPaced(t *testing.T) {
 		m.KTime = k
 		require.NoError(t, r.ReportTraceEvent(tr, m))
 		// Busy-free pacing: sleeping per sample at 2500Hz is 400us, which the
-		// scheduler honours well enough for this purpose.
+		// scheduler honors well enough for this purpose.
 		next := start.Add(time.Duration(i+1) * period)
 		if d := time.Until(next); d > 0 {
 			time.Sleep(d)

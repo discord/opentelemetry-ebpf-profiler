@@ -46,7 +46,8 @@ func (b *baseReporter) Stop() {
 }
 
 func (b *baseReporter) ReportTraceEvent(trace *libpf.Trace, meta *samples.TraceEventMeta) error {
-	if meta.ProfileType == nil {
+	// Aggregation stores labels once per stack; beamscope labels vary per event.
+	if meta.ProfileType == nil || samples.BeamScopeValueKind(meta.ProfileType) != samples.ValueKindNone {
 		return fmt.Errorf("skip reporting trace: %w", errUnknownProfileType)
 	}
 

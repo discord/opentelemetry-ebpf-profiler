@@ -3,17 +3,7 @@
 
 package main
 
-// Discord addition: wiring for the beamscope BEAM runtime-instrumentation
-// plugin (interpreter/beamscope). Kept in its own file so the delta on
-// upstream's main.go and cli_flags.go is one call each, which is what keeps
-// rebases cheap.
-//
-// With -beamscope set, the agent discovers beam_scope shared-memory segments
-// exported by the BEAM-resident NIF, reports GC allocation deltas through the
-// active reporter (they land in the same pprof files as CPU samples, origin
-// "beamscope"), and optionally writes the panel/monitor/process record stream
-// as JSONL files under -beamscope-jsonl-dir. Without it, nothing here changes
-// behaviour.
+// CLI configuration for the beamscope shared-memory reader.
 
 import (
 	"flag"

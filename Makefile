@@ -1,7 +1,7 @@
 .PHONY: all all-common clean ebpf generate generate-collector test test-deps \
 	test-junit test-luajit-offsets protobuf docker-image agent license-check license-save \
 	integration-test-binaries \
-	codespell lint format format-ebpf format-go pprof-execs \
+	codespell lint ebpf-profiler format format-ebpf format-go pprof-execs \
 	processctx-execs host-integration-tests \
 	pprof_1_23 pprof_1_24 pprof_1_24_cgo otelcol-ebpf-profiler \
 	rust-components rust-targets rust-tests vanity-import-check vanity-import-fix \
@@ -66,6 +66,9 @@ generate:
 
 ebpf: generate
 	$(MAKE) $(EBPF_FLAGS) -C support/ebpf
+
+ebpf-profiler: ebpf
+	go build $(GO_FLAGS) -tags "$(GO_TAGS)" -o $@ .
 
 generate-collector:
 	GOARCH=$(NATIVE_ARCH) go tool $(GO_TOOLS) builder \

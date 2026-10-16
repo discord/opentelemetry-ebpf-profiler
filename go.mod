@@ -11,14 +11,13 @@ module go.opentelemetry.io/ebpf-profiler
 go 1.26.0
 
 require (
- github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3
- go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.46.0
 	github.com/aws/aws-sdk-go-v2 v1.47.2
 	github.com/aws/aws-sdk-go-v2/config v1.33.8
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.2
 	github.com/cilium/ebpf v0.22.0
 	github.com/elastic/go-freelru v0.16.0
 	github.com/elastic/go-perf v0.0.0-20260224073651-af0ee0c731b7
+	github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3
 	github.com/google/uuid v1.6.0
 	github.com/klauspost/compress v1.20.1
 	github.com/mdlayher/kobject v0.0.0-20200520190114-19ca17470d7d
@@ -39,10 +38,13 @@ require (
 	go.opentelemetry.io/collector/receiver/receivertest v0.162.0
 	go.opentelemetry.io/collector/receiver/xreceiver v0.162.0
 	go.opentelemetry.io/otel v1.47.0
+	go.opentelemetry.io/otel/exporters/stdout/stdoutmetric v1.46.0
 	go.opentelemetry.io/otel/metric v1.47.0
+	go.opentelemetry.io/otel/sdk/metric v1.46.0
 	go.opentelemetry.io/proto/otlp v1.11.1
 	go.opentelemetry.io/proto/otlp/processcontext/v1development v0.4.1
 	go.opentelemetry.io/proto/otlp/profiles/v1development v0.4.1
+	go.uber.org/zap v1.28.0
 	go.uber.org/zap/exp v0.3.0
 	golang.org/x/arch v0.31.0
 	golang.org/x/exp v0.0.0-20261007192929-f45ad48fbe92
@@ -97,10 +99,8 @@ require (
 	go.opentelemetry.io/collector/pipeline v1.68.0 // indirect
 	go.opentelemetry.io/otel/log v1.47.0 // indirect
 	go.opentelemetry.io/otel/sdk v1.46.0 // indirect
-	go.opentelemetry.io/otel/sdk/metric v1.46.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
-	go.uber.org/zap v1.28.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
 	golang.org/x/net v0.59.0 // indirect
 	golang.org/x/text v0.42.0 // indirect

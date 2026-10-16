@@ -3,14 +3,7 @@
 
 package main
 
-// Discord addition: write the agent's own metrics to a local file.
-//
-// The agent counts what it drops -- failed pid_events writes, reported-PID
-// errors, unknown-PC traces, ring-buffer losses -- and those counters are the
-// only way to tell "the profiler missed this process" from "the process was
-// idle". Upstream ships them to the collector alongside profiles; the local
-// pprof egress has no collector, so without this they go nowhere and a lossy
-// capture is indistinguishable from a quiet one.
+// Optional JSONL export of the profiler's own metrics.
 
 import (
 	"context"

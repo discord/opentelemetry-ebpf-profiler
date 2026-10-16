@@ -47,11 +47,6 @@ func TestSegmentHeaderValidation(t *testing.T) {
 		"ring offset that wraps uint64 in the bounds check")
 }
 
-// TestSegmentRingOffsetOverflowIsRejected is FIX-1 in isolation: before the
-// overflow-safe bounds check, a hostile 8-aligned ring_offset near uint64 max
-// wrapped off+ringCtrlSize+ring_data_size around to a small value, passed
-// validation, and panicked with an out-of-range index. It must now be a clean
-// error (the segment is another process's memory: untrusted input).
 func TestSegmentRingOffsetOverflowIsRejected(t *testing.T) {
 	f := newFixture(t, 2, 4096)
 	// Wrapping, 8-aligned, and >= header size, so it clears every check but
@@ -62,12 +57,6 @@ func TestSegmentRingOffsetOverflowIsRejected(t *testing.T) {
 	}
 }
 
-// TestSegmentHostileReadPosParksRingNoPanic is FIX-2: a resumed read_pos taken
-// from the untrusted segment is now alignment/range-validated. A misaligned
-// read_pos with idx = ring_data_size-1 made the 2-byte len read cross the end
-// of the mapping and panic. The segment here is packed so the last ring's data
-// ends exactly at total_size (no page slack), reproducing that geometry; the
-// ring must be parked as corruption instead of crashing.
 func TestSegmentHostileReadPosParksRingNoPanic(t *testing.T) {
 	const rds = 64 // power of two; NewSegment only requires that
 	total := segmentHeaderSize + ringCtrlSize + rds
@@ -100,8 +89,6 @@ func TestSegmentHostileReadPosParksRingNoPanic(t *testing.T) {
 	}
 }
 
-// TestSegmentReadPosPastWritePosParksRing is the range half of FIX-2: a
-// read_pos beyond write_pos is also treated as corruption at NewSegment time.
 func TestSegmentReadPosPastWritePosParksRing(t *testing.T) {
 	f := newFixture(t, 1, 4096)
 	// 8-aligned but past write_pos (which is 0).
@@ -113,15 +100,6 @@ func TestSegmentReadPosPastWritePosParksRing(t *testing.T) {
 	}
 }
 
-// TestDrainOverflowWholeRegionZeroedAcrossLaps is FIX-4 (ABI v1.1): the reader
-// must zero the ENTIRE consumed byte range on the overflow ring, not just each
-// record's len word. Record boundaries do not align across laps, so a lap-N+1
-// reservation can start at an offset that was lap-N record interior; if only
-// the len words were zeroed, that interior byte stays non-zero and a reader
-// polling between the writer's CAS reservation and its zero-len step could
-// read it as a bogus len and desync. The test proves the interior byte is
-// zeroed and that a reservation landing on it reads as in-flight, not a
-// misparsed record.
 func TestDrainOverflowWholeRegionZeroedAcrossLaps(t *testing.T) {
 	f := newFixture(t, 2, 256)
 	ov := 1
@@ -131,7 +109,7 @@ func TestDrainOverflowWholeRegionZeroedAcrossLaps(t *testing.T) {
 	// i.e. data index 40 for the first record: interior payload, never a len
 	// word. Give it a distinctive non-zero value.
 	const epoch = uint32(0x11223344)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		f.mustWrite(t, ov, encTopkSend(tK, tU, uint64(i+1), 7, epoch, uint8(i)))
 	}
 	// Confirm the interior byte is non-zero before the drain (so the post-drain
@@ -146,7 +124,7 @@ func TestDrainOverflowWholeRegionZeroedAcrossLaps(t *testing.T) {
 	// Whole-region zeroing: every byte of the consumed range [0,240) is zero,
 	// including the record-interior epoch byte at index 40. The old
 	// len-word-only rule would have left index 40 holding 0x44.
-	for off := uint64(0); off < 240; off++ {
+	for off := range uint64(240) {
 		if f.data[f.dataOff(ov)+off] != 0 {
 			t.Fatalf("consumed byte at index %d not zeroed: 0x%02x",
 				off, f.data[f.dataOff(ov)+off])
@@ -237,7 +215,7 @@ func TestDrainWraparoundWithPad(t *testing.T) {
 		return encTopkSend(tK+uint64(i), tU+uint64(i), uint64(i), 100, 1, uint8(i))
 	}
 	seg := f.mustSegment(t)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if !f.writeRecord(0, rec(i)) {
 			t.Fatalf("write %d failed", i)
 		}
@@ -295,7 +273,7 @@ func TestDrainDropCounterVisible(t *testing.T) {
 	// Fill the ring without draining until the writer must drop.
 	f := newFixture(t, 1, 256)
 	wrote, dropped := 0, 0
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		if f.writeRecord(0, encTopkSend(tK, tU, uint64(i), 1, 1, 0)) {
 			wrote++
 		} else {
@@ -468,7 +446,7 @@ func TestDrainOverflowRingStaleLenBehindReservation(t *testing.T) {
 
 	// Lap 1: five 48-byte records fill the ring to 240; the reader consumes
 	// them (zeroing the len words at 0,48,96,144,192 behind itself).
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if !f.writeRecord(overflow, encTopkSend(tK, tU, uint64(i), 1, 1, uint8(i))) {
 			t.Fatalf("write %d failed", i)
 		}
@@ -573,7 +551,7 @@ func TestDrainCompactEightBytePad(t *testing.T) {
 	if !f.writeRecord(0, encTopkSend(tK, tU, 1, 1, 1, 0)) {
 		t.Fatal("write failed")
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if !f.writeRecord(0, encProcExit(tK, tU, uint64(i), 0)) {
 			t.Fatalf("write %d failed", i)
 		}
@@ -680,7 +658,7 @@ func TestDrainShortPadAtBufferEnd(t *testing.T) {
 	// A 16-byte PAD: the compact clock-less form {len, type, flags} plus
 	// fill. Only len/type/flags are meaningful; the fill is skipped by len.
 	f := newFixture(t, 1, 256)
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if !f.writeRecord(0, encTopkSend(tK, tU, uint64(i), 1, 1, 0)) {
 			t.Fatalf("write %d failed", i)
 		}

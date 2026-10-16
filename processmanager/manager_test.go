@@ -31,6 +31,33 @@ import (
 
 type nopEbpf struct{ interpreter.EbpfHandler }
 
+type closingInstance struct {
+	interpreter.InstanceStubs
+	detached int
+}
+
+func (i *closingInstance) Detach(interpreter.EbpfHandler, libpf.PID) error {
+	i.detached++
+	return nil
+}
+
+func TestCloseDetachesInterpretersAndPreventsReattachment(t *testing.T) {
+	i := &closingInstance{}
+	pm := &ProcessManager{interpreters: map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance{
+		123: {{}: i},
+	}}
+	pm.Close()
+	pm.Close()
+	require.Equal(t, 1, i.detached)
+	require.Empty(t, pm.interpreters)
+
+	pr := process.New(123, 123)
+	t.Cleanup(func() { _ = pr.Close() })
+	_, err := pm.handleNewInterpreter(pr, 0, util.OnDiskFileIdentifier{}, nil, false)
+	require.NoError(t, err)
+	require.Empty(t, pm.interpreters)
+}
+
 func (nopEbpf) UpdateProcData(libpf.InterpreterType, libpf.PID, unsafe.Pointer) error {
 	return nil
 }

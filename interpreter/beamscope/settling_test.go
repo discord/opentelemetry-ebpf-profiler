@@ -17,9 +17,6 @@ import (
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
 )
 
-// TestFrameRanking pins the ABI display ranking:
-// registered_name > translated MFA > untranslated MFA > pid_printable,
-// then the opaque key when nothing is cached.
 func TestFrameRanking(t *testing.T) {
 	s := newReporterSink(&mockReporter{}, 4242)
 	meta := func(flags uint32, module, function string, arity uint8,
@@ -103,8 +100,6 @@ func settle(t *testing.T) (*fixture, *drainer, *mockReporter) {
 	return f, d, mock
 }
 
-// TestMetaSettlingReleaseOnArrival is the exact guilds failure: a GC record
-// drained BEFORE its PROC_META must still get the translated frame.
 func TestMetaSettlingReleaseOnArrival(t *testing.T) {
 	f, d, mock := settle(t)
 	if !f.writeRecord(0, encGCDelta2(tK, tU, 0x3001, 40_000, 0, 0, 100, 1_000, 0)) {
@@ -142,8 +137,6 @@ func TestMetaSettlingReleaseOnArrival(t *testing.T) {
 	}
 }
 
-// TestMetaSettlingExpiry: with no PROC_META forthcoming, the hold expires
-// after heldMaxCycles polls and converts with the fallback ranking.
 func TestMetaSettlingExpiry(t *testing.T) {
 	f, d, mock := settle(t)
 	if !f.writeRecord(0, encSchedDelta(schedDeltaFlagUnclassified, tK, tU,
@@ -165,20 +158,14 @@ func TestMetaSettlingExpiry(t *testing.T) {
 	if mock.metas[0].Value != 7_000_000 {
 		t.Fatalf("expired sample value %d, want 7000000", mock.metas[0].Value)
 	}
-	if mock.metas[0].ValueKind != samples.ValueKindSchedNS {
-		t.Fatalf("expired sample ValueKind %d, want ValueKindSchedNS", mock.metas[0].ValueKind)
-	}
-	if mock.metas[0].OffTime != 0 {
-		t.Fatalf("expired sample OffTime %d, want 0 (retired as a beamscope value channel)",
-			mock.metas[0].OffTime)
+	if samples.BeamScopeValueKind(mock.metas[0].ProfileType) != samples.ValueKindSchedNS {
+		t.Fatalf("expired sample ValueKind %d, want ValueKindSchedNS", samples.BeamScopeValueKind(mock.metas[0].ProfileType))
 	}
 	if len(d.held) != 0 {
 		t.Fatalf("held = %d after expiry, want 0", len(d.held))
 	}
 }
 
-// TestMetaSettlingCap: past the cap the OLDEST held record is converted
-// immediately (never discarded) and counted as evicted.
 func TestMetaSettlingCap(t *testing.T) {
 	f, d, mock := settle(t)
 	d.heldCap = 2
@@ -208,8 +195,8 @@ func TestMetaSettlingCap(t *testing.T) {
 	vals := map[int64]bool{}
 	for _, m := range mock.metas {
 		vals[m.Value] = true
-		if m.ValueKind != samples.ValueKindAlloc {
-			t.Errorf("sample ValueKind %d, want ValueKindAlloc", m.ValueKind)
+		if samples.BeamScopeValueKind(m.ProfileType) != samples.ValueKindAlloc {
+			t.Errorf("sample ValueKind %d, want ValueKindAlloc", samples.BeamScopeValueKind(m.ProfileType))
 		}
 	}
 	if !vals[1000] || !vals[2000] || !vals[3000] {
@@ -217,10 +204,6 @@ func TestMetaSettlingCap(t *testing.T) {
 	}
 }
 
-// TestRecordedFixtureV3 decodes the writer peer's v3 recorded segment
-// (registered_name / current_function era) once it lands; skips until then.
-// Assertions are provisional until the orchestrator relays the writer's
-// ground-truth counts.
 func TestRecordedFixtureV3(t *testing.T) {
 	seg := loadRecordedSegment(t, "BEAMSCOPE_FIXTURE_V3", "shm_v3.bin")
 	recs, st := collect(seg)

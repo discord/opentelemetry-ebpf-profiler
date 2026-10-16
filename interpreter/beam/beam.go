@@ -479,8 +479,7 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		return nil, err
 	}
 
-	// Per-sample Erlang process attribution (Discord). Purely additive: it
-	// either validates and enables, or logs and leaves the map untouched.
+	// Enable Erlang attribution when the scheduler layout can be validated.
 	schedTids := d.enableSchedAttribution(ebpf, pid, bias, rm)
 
 	return &beamInstance{
@@ -493,7 +492,7 @@ func (d *beamData) Attach(ebpf interpreter.EbpfHandler, pid libpf.PID, bias libp
 		mfaNameCache:         mfaNameCache,
 		stringCache:          stringCache,
 		framePointersEnabled: data.Frame_pointers_enabled,
- schedTids: schedTids,
+		schedTids:            schedTids,
 	}, nil
 }
 
@@ -563,8 +562,7 @@ func (i *beamInstance) SynchronizeMappings(ebpf interpreter.EbpfHandler, _ repor
 }
 
 func (i *beamInstance) Detach(ebpf interpreter.EbpfHandler, _ libpf.PID) error {
-	// See support/ebpf/beam_sched.h's identity section for why this delete
-	// is keyed on (tgid, tid) rather than tid alone.
+	// Remove only scheduler entries still owned by this BEAM process.
 	disableSchedAttribution(ebpf, i.schedTids, i.pid)
 	i.schedTids = nil
 	return nil

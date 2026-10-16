@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -21,8 +22,50 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
 )
+
+func TestSocketRejectsLabelsThatExceedWireOrBufferLimits(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		frames, labels int
+	}{
+		{"label count", 0, 1 << 16},
+		{"record size", 0xffff, (socketWriteBufBytes-5-socketSampleFixedLen-0xffff*socketFrameLen)/socketLabelLen + 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := newSocketSink(SocketConfig{Path: "unused", MaxFrames: 0xffff})
+			require.NoError(t, err)
+			attach(s, &bufferConn{})
+			ev := &sampleEvent{frames: make([]frame, tc.frames), labels: make(map[string]string, tc.labels)}
+			for i := 0; i < tc.labels; i++ {
+				ev.labels[strconv.Itoa(i)] = "value"
+			}
+			require.Error(t, s.writeSample(ev))
+			require.Zero(t, s.pendingSamples)
+			require.Zero(t, s.st.emitted.Load())
+		})
+	}
+}
+
+func TestSocketDropDeltaSurvivesFailedFlush(t *testing.T) {
+	s, err := newSocketSink(SocketConfig{Path: "unused"})
+	require.NoError(t, err)
+	attach(s, &failingConn{})
+	s.st.droppedRing.Add(3)
+	require.NoError(t, s.writeSample(oneSample()))
+	err = s.flush()
+	require.Error(t, err)
+	s.connFailed(err)
+
+	c := &bufferConn{}
+	attach(s, c)
+	require.NoError(t, s.writeHeader())
+	require.NoError(t, s.writeSample(oneSample()))
+	require.NoError(t, s.flush())
+	stream := readStream(t, bytes.NewReader(c.buf.Bytes()))
+	require.Len(t, stream.samples, 1)
+	require.Equal(t, uint32(4), stream.samples[0].droppedSincePrev)
+}
 
 // decodedSample is what a consumer reconstructs from the wire, used here to
 // assert the framing round-trips.
@@ -137,14 +180,14 @@ func readStream(t *testing.T, r io.Reader) *decodedStream {
 					"value must be zero when no kind claims it")
 			}
 			fr := p[int(out.sampleFixedLen):]
-			for i := 0; i < nf; i++ {
+			for i := range nf {
 				o := i * socketFrameLen
 				s.funcs = append(s.funcs, strs[binary.LittleEndian.Uint32(fr[o:o+4])])
 				s.files = append(s.files, strs[binary.LittleEndian.Uint32(fr[o+4:o+8])])
 				s.lines = append(s.lines, int32(binary.LittleEndian.Uint32(fr[o+8:o+12])))
 			}
 			lb := fr[nf*socketFrameLen:]
-			for i := 0; i < nl; i++ {
+			for i := range nl {
 				o := i * int(out.labelStride)
 				dl := decodedLabel{
 					key:  strs[binary.LittleEndian.Uint32(lb[o:o+4])],
@@ -238,12 +281,10 @@ func newListenerGated(t *testing.T, gate chan struct{}) *listener {
 	ln, err := net.Listen("unix", p)
 	require.NoError(t, err)
 	l := &listener{path: p, ln: ln, gate: gate, eof: make(chan struct{})}
-	l.wg.Add(1)
-	go func() {
-		defer l.wg.Done()
+	l.wg.Go(func() {
 		defer close(l.eof)
 		serveOne(ln, l, l.gate)
-	}()
+	})
 	t.Cleanup(func() { _ = ln.Close(); l.wg.Wait() })
 	return l
 }
@@ -270,8 +311,6 @@ func (l *listener) bytes() []byte {
 	return out
 }
 
-// The socket path must carry the same frames, in the same order, as the pprof
-// path, for the same ReportTraceEvent calls.
 func TestSocketSinkCarriesTheSameSamples(t *testing.T) {
 	l := newListener(t)
 	dir := t.TempDir()
@@ -283,7 +322,7 @@ func TestSocketSinkCarriesTheSameSamples(t *testing.T) {
 	require.NoError(t, r.Start(t.Context()))
 
 	tr := testTrace(t, "root", "mid", "leaf")
-	for i := int64(0); i < 20; i++ {
+	for i := range int64(20) {
 		require.NoError(t, r.ReportTraceEvent(tr,
 			meta(5_000+i, 100, 101, "1_scheduler", "beam.smp", "cafe01")))
 	}
@@ -329,8 +368,6 @@ func TestSocketSinkCarriesTheSameSamples(t *testing.T) {
 		st.lastStats["emitted"]+st.lastStats["droppedRing"]+st.lastStats["droppedNoSock"])
 }
 
-// A slow consumer must cost samples, not latency, and the loss must be visible
-// both in the counter and next to the gap on the wire.
 func TestSocketSinkDropsRatherThanBlocks(t *testing.T) {
 	gate := make(chan struct{})
 	l := newListenerGated(t, gate)
@@ -349,7 +386,7 @@ func TestSocketSinkDropsRatherThanBlocks(t *testing.T) {
 	tr := testTrace(t, "root", "leaf")
 	const n = 20000
 	start := time.Now()
-	for i := int64(0); i < n; i++ {
+	for i := range int64(n) {
 		require.NoError(t, r.ReportTraceEvent(tr,
 			meta(i, 100, 101, "1_scheduler", "beam.smp", "cafe01")))
 	}
@@ -396,7 +433,6 @@ func TestSocketSinkDropsRatherThanBlocks(t *testing.T) {
 	assert.True(t, found, "pprof comments must record the socket drop count: %v", p.Comments)
 }
 
-// No consumer at all is a drop, not a stall and not a crash.
 func TestSocketSinkSurvivesNoConsumer(t *testing.T) {
 	dir := t.TempDir()
 	sock := filepath.Join(t.TempDir(), "absent.sock")
@@ -407,7 +443,7 @@ func TestSocketSinkSurvivesNoConsumer(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, r.Start(t.Context()))
 	tr := testTrace(t, "root", "leaf")
-	for i := int64(0); i < 500; i++ {
+	for i := range int64(500) {
 		require.NoError(t, r.ReportTraceEvent(tr, meta(i, 1, 2, "c", "p", "x")))
 	}
 	require.NoError(t, r.Flush())
@@ -418,7 +454,6 @@ func TestSocketSinkSurvivesNoConsumer(t *testing.T) {
 	assert.Len(t, p.Sample, 500)
 }
 
-// A stack deeper than the cap is flagged, not silently shortened.
 func TestSocketSinkFlagsFrameTruncation(t *testing.T) {
 	l := newListener(t)
 	dir := t.TempDir()
@@ -442,8 +477,6 @@ func TestSocketSinkFlagsFrameTruncation(t *testing.T) {
 	assert.Equal(t, uint64(1), st.lastStats["truncFrames"])
 }
 
-// A frame with no symbol renders identically on both paths -- flatten() does
-// it once, upstream of the fork in the data flow.
 func TestSocketSinkUnsymbolizedFrameMatchesPprof(t *testing.T) {
 	l := newListener(t)
 	dir := t.TempDir()
@@ -548,11 +581,6 @@ func oneSample() *sampleEvent {
 	}
 }
 
-// A record handed to the 1 MiB write buffer has NOT reached the consumer.
-// Counting it as emitted there is what let a consumer restart discard up to a
-// megabyte of samples while STATS reported them delivered -- and, because
-// Dropped() did not know about that channel either, let the equivalence
-// fixture's require.Zero certify a lossy stream as loss-free.
 func TestSocketSinkEmittedCountsOnlyWhatReachedTheWire(t *testing.T) {
 	healthy, err := newSocketSink(SocketConfig{Path: "unused"})
 	require.NoError(t, err)
@@ -579,8 +607,6 @@ func TestSocketSinkEmittedCountsOnlyWhatReachedTheWire(t *testing.T) {
 		"loss on the write path must reach Dropped(), or the guards are blind")
 }
 
-// A write failure mid-stream is loss, and a profiler that reports it as
-// "emitted" is worse than one that crashes.
 func TestSocketSinkWriteFailureMakesDroppedNonzero(t *testing.T) {
 	s, err := newSocketSink(SocketConfig{
 		Path: "unused", FlushInterval: 2 * time.Millisecond, StatsInterval: time.Hour,
@@ -588,7 +614,7 @@ func TestSocketSinkWriteFailureMakesDroppedNonzero(t *testing.T) {
 	require.NoError(t, err)
 	attach(s, &failingConn{})
 	s.start()
-	for i := 0; i < 4; i++ {
+	for range 4 {
 		s.offer(oneSample())
 	}
 	deadline := time.Now().Add(5 * time.Second)
@@ -605,10 +631,6 @@ func TestSocketSinkWriteFailureMakesDroppedNonzero(t *testing.T) {
 			s.st.droppedRing.Load()-s.st.droppedNoSock.Load())
 }
 
-// A consumer that connects and then stops reading WITHOUT closing wedges the
-// writer inside a blocking write, where it never observes the stop channel.
-// Unbounded, shutdown() waits on that forever: SIGINT does nothing and the
-// agent has to be SIGKILLed.
 func TestSocketSinkShutdownIsBoundedWhenTheWriterIsWedged(t *testing.T) {
 	s, err := newSocketSink(SocketConfig{
 		Path: "unused", FlushInterval: 5 * time.Millisecond, StatsInterval: time.Hour,
@@ -635,13 +657,6 @@ func TestSocketSinkShutdownIsBoundedWhenTheWriterIsWedged(t *testing.T) {
 	}
 }
 
-// The shutdown backstop must always outlast ONE write deadline, for every
-// WriteTimeout a user can set. Before this was derived, socketShutdownTimeout
-// was a flat 2s while -socket-egress-write-timeout advertised a 5s max: a 3s
-// setting inverted them, so a wedged consumer's shutdown hit the backstop
-// first, skipped the final STATS record, and accounted its loss through the
-// explicitly-approximate residual instead of exactly. Mutation-check: make
-// shutdownTimeout a constant again and the 3s/5s/hour cases fail.
 func TestSocketShutdownBudgetAlwaysExceedsWriteDeadline(t *testing.T) {
 	for _, wt := range []time.Duration{
 		0, // unset: the reporter's default
@@ -656,10 +671,6 @@ func TestSocketShutdownBudgetAlwaysExceedsWriteDeadline(t *testing.T) {
 	}
 }
 
-// End to end over a real unix socket: a consumer that accepts and never reads
-// must cost samples and a torn-down connection, not the agent's ability to
-// exit. This is the write deadline doing its job; the bound above is the
-// backstop for when it cannot.
 func TestSocketSinkStalledConsumerDoesNotBlockStop(t *testing.T) {
 	gate := make(chan struct{}) // held shut: the consumer never reads
 	l := newListenerGated(t, gate)
@@ -687,7 +698,7 @@ func TestSocketSinkStalledConsumerDoesNotBlockStop(t *testing.T) {
 	// absorbed. At ~105 bytes a sample this is ~5 MiB against ~1.25 MiB of
 	// buffering, a margin a kernel autotuning its socket buffer cannot close.
 	const n = 50000
-	for i := int64(0); i < n; i++ {
+	for i := range int64(n) {
 		require.NoError(t, r.ReportTraceEvent(tr, meta(i, 100, 101, "c", "p", "x")))
 	}
 	require.NoError(t, r.Flush())
@@ -700,9 +711,6 @@ func TestSocketSinkStalledConsumerDoesNotBlockStop(t *testing.T) {
 	assert.Len(t, readOne(t, dir).Sample, n)
 }
 
-// connectErrors was incremented by connFailed AND again by the run loop, so one
-// dead connection read as two -- which matters because the counter is on the
-// wire and a consumer uses it to decide whether a gap was its own fault.
 func TestSocketSinkCountsOneConnectErrorPerFailure(t *testing.T) {
 	s, err := newSocketSink(SocketConfig{Path: filepath.Join(t.TempDir(), "absent.sock")})
 	require.NoError(t, err)
@@ -717,14 +725,6 @@ func TestSocketSinkCountsOneConnectErrorPerFailure(t *testing.T) {
 	assert.Equal(t, uint64(3), s.st.connectErrors.Load())
 }
 
-// The loss warning must describe NEW loss. Warning on the cumulative total
-// makes a single dropped sample warn every stats interval for the life of the
-// process, which is how a real warning gets ignored.
-// It asserts on lossWarning(), logIfLossy's decision, rather than capturing the
-// package-global logger: internal/log exposes no way to read the logger back,
-// so a test that swapped it could only "restore" a freshly built stderr logger
-// and would silently discard whatever level or handler the binary had
-// configured for every test that ran after it.
 func TestSocketSinkWarnsOnlyWhenLossGrows(t *testing.T) {
 	s, err := newSocketSink(SocketConfig{Path: "unused"})
 	require.NoError(t, err)
@@ -746,10 +746,6 @@ func TestSocketSinkWarnsOnlyWhenLossGrows(t *testing.T) {
 	assert.Contains(t, msg, "socket egress dropped 3 samples")
 }
 
-// bytesWritten is what a consumer reconciles against its own received count, so
-// it has to be bytes the socket accepted -- not bytes handed to a 1 MiB buffer,
-// which overstates the stream by up to the buffer size and permanently so once
-// a connection dies with it full.
 func TestSocketSinkBytesWrittenCountsOnlyDeliveredBytes(t *testing.T) {
 	s, err := newSocketSink(SocketConfig{Path: "unused"})
 	require.NoError(t, err)
@@ -765,11 +761,6 @@ func TestSocketSinkBytesWrittenCountsOnlyDeliveredBytes(t *testing.T) {
 	assert.Equal(t, uint64(delivered), s.st.bytesWritten.Load())
 }
 
-// F2: the bounded shutdown abandons the writer, and everything the writer held
-// -- the ring, and up to a megabyte of buffered records -- is charged to
-// produced and to nothing else. Left unaccounted, Dropped() reports 0 for a run
-// that lost all of it, which is the one answer the equivalence fixture's
-// require.Zero cannot survive being wrong about.
 func TestSocketSinkAbandonedWriterChargesItsResidual(t *testing.T) {
 	s, err := newSocketSink(SocketConfig{
 		Path: "unused", FlushInterval: 5 * time.Millisecond, StatsInterval: time.Hour,
@@ -781,7 +772,7 @@ func TestSocketSinkAbandonedWriterChargesItsResidual(t *testing.T) {
 	s.start()
 
 	const n = 3
-	for i := 0; i < n; i++ {
+	for range n {
 		s.offer(oneSample())
 	}
 	// Let the flush ticker wedge the writer inside a write it cannot finish.
@@ -800,10 +791,6 @@ func TestSocketSinkAbandonedWriterChargesItsResidual(t *testing.T) {
 	assert.Zero(t, s.residualUnaccounted(), "nothing may be left unexplained")
 }
 
-// F4: bufio flushes on its own when the 1 MiB buffer fills, and pendingSamples
-// is only cleared by flush(). Records that DID reach the consumer were then
-// charged to droppedWrite and never counted as emitted -- and at ~20 MB/s the
-// buffer fills every ~50ms, so that was the steady state.
 func TestSocketSinkEmittedIsExactAcrossABufferFill(t *testing.T) {
 	s, err := newSocketSink(SocketConfig{Path: "unused"})
 	require.NoError(t, err)
@@ -812,7 +799,7 @@ func TestSocketSinkEmittedIsExactAcrossABufferFill(t *testing.T) {
 
 	// ~105 bytes a sample, so this overruns the 1 MiB write buffer twice over.
 	const n = 20000
-	for i := 0; i < n; i++ {
+	for range n {
 		require.NoError(t, s.writeSample(oneSample()))
 	}
 	emitted := s.st.emitted.Load()
@@ -831,11 +818,6 @@ func TestSocketSinkEmittedIsExactAcrossABufferFill(t *testing.T) {
 	assert.Equal(t, emitted, s.st.emitted.Load(), "a delivered sample stays delivered")
 }
 
-// F3: the pprof archive was built before the socket drain, so a consumer dying
-// in the last flush window produced a file that said "no loss" for a run whose
-// log warned about loss -- while build()'s own comment claims the two artifacts
-// cross-attest. failingConn makes the case exact: nothing fails until the drain
-// flushes, and the drain is what Stop() must reach first.
 func TestSocketDropsInTheFinalDrainReachThePprofComment(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{
@@ -855,7 +837,7 @@ func TestSocketDropsInTheFinalDrainReachThePprofComment(t *testing.T) {
 
 	tr := testTrace(t, "root", "leaf")
 	const n = 50
-	for i := int64(0); i < n; i++ {
+	for i := range int64(n) {
 		require.NoError(t, r.ReportTraceEvent(tr, meta(i, 100, 101, "c", "p", "x")))
 	}
 	r.Stop()
@@ -872,14 +854,6 @@ func TestSocketDropsInTheFinalDrainReachThePprofComment(t *testing.T) {
 		"the archive must state the drain's loss: %v", p.Comments)
 }
 
-// A sample must be on the wire as soon as it is written, without waiting for
-// any ticker. Batching in the 1 MiB buffer made delivery latency a function of
-// FlushInterval (50ms by default, and unbounded if a caller set it high), which
-// is exactly the file-flush latency floor this egress exists to remove.
-//
-// Both tickers are set to an hour, so nothing but a per-sample flush can
-// promote a sample to emitted before shutdown: against the batching code this
-// test times out at zero emitted.
 func TestSocketSinkFlushesEachSampleWithoutWaitingForATicker(t *testing.T) {
 	s, err := newSocketSink(SocketConfig{
 		Path: "unused", FlushInterval: time.Hour, StatsInterval: time.Hour,
@@ -924,11 +898,6 @@ func TestSocketSinkFlushesEachSampleWithoutWaitingForATicker(t *testing.T) {
 	assert.Zero(t, s.Dropped())
 }
 
-// Shutdown can reach the drain with samples queued and nothing dialed yet:
-// run() dials on the first sample it processes, and its select picks between a
-// ready stop and a ready ring at random. Before the drain dialed, that path
-// charged every queued sample to droppedNoSock and closed without connecting,
-// so a run whose first samples coincided with shutdown delivered nothing.
 func TestSocketSinkDrainDialsForQueuedSamples(t *testing.T) {
 	l := newListener(t)
 	s, err := newSocketSink(SocketConfig{Path: l.path, FlushInterval: time.Hour})
@@ -945,8 +914,6 @@ func TestSocketSinkDrainDialsForQueuedSamples(t *testing.T) {
 	assert.Zero(t, s.Dropped(), "queued samples must not be charged as dropped")
 }
 
-// The same path with no consumer must stay bounded and honest: one dial
-// attempt, no backoff loop, and the samples counted as dropped.
 func TestSocketSinkDrainDialFailureStaysBounded(t *testing.T) {
 	s, err := newSocketSink(SocketConfig{
 		Path: filepath.Join(t.TempDir(), "absent.sock"), FlushInterval: time.Hour,
@@ -980,19 +947,16 @@ func beamscopeEvent(t *testing.T) (*libpf.Trace, *samples.TraceEventMeta) {
 	tr.CustomLabels = map[libpf.String]libpf.String{
 		libpf.Intern("pause_ns"):       libpf.Intern("4096"),
 		libpf.Intern("mbuf_words"):     libpf.Intern("77"),
+		libpf.Intern("empty"):          libpf.Intern(""),
 		libpf.Intern("beamscope_kind"): libpf.Intern("alloc"),
 	}
 	m := meta(7, 11, 12, "beam.smp", "p", "x")
-	m.Origin = support.TraceOriginBeamScope
 	m.Value = 54_321
-	m.ValueKind = samples.ValueKindAlloc
+	m.ProfileType = samples.BeamScopeProfile(samples.ValueKindAlloc)
 	m.ErlangPidKey = 0x1234_5678_9abc_def0
 	return tr, m
 }
 
-// The socket must carry a beamscope sample WHOLE with no pprof sink in
-// existence. This is the property that lets -beamscope run socket-only: value,
-// value_kind, erlang_pid_key and custom labels all survive the wire.
 func TestSocketSinkCarriesBeamscopeSampleWithoutPprof(t *testing.T) {
 	l := newListener(t)
 	r, err := NewLocalEgress(LocalEgressConfig{
@@ -1031,8 +995,6 @@ func TestSocketSinkCarriesBeamscopeSampleWithoutPprof(t *testing.T) {
 	assert.Equal(t, "alloc", byKey["beamscope_kind"].str)
 }
 
-// The two backends must agree field for field, or "socket-only" silently means
-// "a different capture". Same event, both backends, compared.
 func TestSocketBeamscopeSampleMatchesPprof(t *testing.T) {
 	l := newListener(t)
 	dir := t.TempDir()
@@ -1079,9 +1041,6 @@ func TestSocketBeamscopeSampleMatchesPprof(t *testing.T) {
 	assert.Equal(t, ps.Label["beamscope_kind"][0], byKey["beamscope_kind"].str)
 }
 
-// A traced process must not be able to overwrite the reporter's own fields by
-// emitting a custom label of a contract name -- the same rule the pprof path
-// enforces, enforced identically here.
 func TestSocketSinkSkipsReservedLabelNames(t *testing.T) {
 	l := newListener(t)
 	r, err := NewLocalEgress(LocalEgressConfig{
@@ -1109,9 +1068,6 @@ func TestSocketSinkSkipsReservedLabelNames(t *testing.T) {
 	assert.Equal(t, "realcomm", st.samples[0].comm)
 }
 
-// Labels are serialized in sorted key order so two identical captures produce
-// identical bytes. Map range order would make this flaky rather than wrong,
-// which is worse.
 func TestSocketSinkLabelOrderIsDeterministic(t *testing.T) {
 	run := func() []string {
 		l := newListener(t)

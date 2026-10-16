@@ -1,26 +1,11 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-// Discord addition. Shared-memory segment parsing and ring draining for the
-// beam_scope ABI v1 (discord_common/ex/beam_scope/ABI.md, section 2).
-//
-// The segment is one header page followed by nrings rings. Each ring is a
-// 64-byte control block {write_pos, read_pos, dropped} plus a power-of-two
-// data area. All rings but the last are strict SPSC with this reader as the
-// single consumer; the last ring is the CAS-reserved overflow ring for
-// unaffiliated writer threads.
-//
-// Drain protocol: load write_pos (acquire), consume records from read_pos,
-// store read_pos back (release). Records never wrap; the writer pads to the
-// buffer boundary with PAD records. len==0 or len%8!=0 is ring corruption:
-// stop draining that ring forever, count it, never crash. The overflow ring
-// differs in ruled ways: a len==0 there is a CAS reservation whose bytes are
-// not yet visible (retried, not corrupt); the reader acquire-loads each
-// record's len word (pairing with the writer's release-store) before reading
-// its payload; and, per ABI v1.1, the reader must zero the ENTIRE consumed
-// byte range (not merely each len word) before the release-store of the
-// advanced read_pos -- otherwise stale interior bytes from a previous lap
-// inside a fresh reservation could be misparsed as a published record.
+// Shared-memory reader for beam_scope ABI v1. Rings contain aligned records
+// that never wrap: PAD records fill the tail. SPSC rings publish write_pos;
+// the final ring reserves space with CAS and publishes each record's length.
+// Its reader must clear all consumed bytes before advancing read_pos, so a
+// new reservation cannot expose stale payload bytes as a record header.
 package beamscope // import "go.opentelemetry.io/ebpf-profiler/interpreter/beamscope"
 
 import (
@@ -127,7 +112,7 @@ func NewSegment(data []byte) (*Segment, error) {
 		return nil, fmt.Errorf("implausible nrings %d", hdr.NRings)
 	}
 	rds := hdr.RingDataSize
-	if rds == 0 || rds&(rds-1) != 0 {
+	if rds < 8 || rds&(rds-1) != 0 {
 		return nil, fmt.Errorf("ring_data_size %d is not a power of two", rds)
 	}
 
@@ -136,12 +121,7 @@ func NewSegment(data []byte) (*Segment, error) {
 	seg.rings = make([]ringState, hdr.NRings)
 	for i := range seg.rings {
 		off := binary.LittleEndian.Uint64(data[64+8*i:])
-		// The offset comes straight from an untrusted segment header, so the
-		// bounds test must not add into off: off+ringCtrlSize+rds can wrap
-		// uint64 and let a hostile, 8-aligned off (e.g. 0xFFFFFFFFFFFFF000)
-		// pass, after which s.data[off+8] panics OOB. Compare via subtraction
-		// against limits instead (TotalSize-off cannot underflow once
-		// off <= TotalSize).
+		// Use subtraction to check bounds without overflowing a corrupt offset.
 		if off < segmentHeaderSize || off%8 != 0 ||
 			off > hdr.TotalSize || hdr.TotalSize-off < ringCtrlSize+uint64(rds) {
 			return nil, fmt.Errorf("ring %d offset %d out of bounds", i, off)
@@ -151,14 +131,8 @@ func NewSegment(data []byte) (*Segment, error) {
 			ctrlOff: off,
 			dataOff: off + ringCtrlSize,
 		}
-		// Resume from the stored read_pos: this reader (or a predecessor
-		// instance in the same profiler) is the only one that writes it. The
-		// resumed value is untrusted (another process's memory, or a stale/
-		// corrupt predecessor state): a read_pos that is not 8-aligned or is
-		// past write_pos would make the len read in drainRing cross the
-		// mapping end and panic. Validate it here and park the ring as
-		// corruption (ABI rule: stop the ring, count it, never crash) rather
-		// than draining from a poisoned position.
+		// Resume read_pos so reattachment does not replay records. Misaligned
+		// or backwards positions park the ring as corrupt.
 		rp := atomic.LoadUint64(seg.u64(off + ctrlOffReadPos))
 		wp := atomic.LoadUint64(seg.u64(off + ctrlOffWritePos))
 		if rp%8 != 0 || rp > wp {
@@ -218,12 +192,7 @@ func (s *Segment) drainRing(r *ringState, isOverflow bool,
 	rds := uint64(s.hdr.RingDataSize)
 	mask := rds - 1
 	if wp < rp || wp-rp > rds || wp%8 != 0 {
-		// The writer moved backwards, overran the reader, or published a
-		// non-8-aligned write_pos: all violate the protocol (records are a
-		// multiple of 8 and the writer drops instead of overwriting unread
-		// data). The alignment guard is cheap defense against an untrusted
-		// write_pos that would otherwise leave the reader chasing a partial
-		// tail forever.
+		// The writer must publish aligned positions and never overrun unread data.
 		r.corrupt = true
 		st.CorruptRings++
 		return
@@ -244,15 +213,8 @@ func (s *Segment) drainRing(r *ringState, isOverflow bool,
 		}
 		var recLen uint64
 		if isOverflow {
-			// The overflow ring's publication edge is a release-store of the
-			// record's len word (write_pos is CAS-advanced before the bytes
-			// exist), so write_pos is NOT the acquire edge here. Acquire-load
-			// the 8-aligned publication word (len/type/flags) and derive len
-			// from it: this pairs with the writer's release-store so a
-			// non-zero len is never observed with stale pre-publication
-			// payload/clock bytes (a real hazard on weakly-ordered targets
-			// such as arm64). base is 8-aligned by construction (dataOff and
-			// rp are both multiples of 8), so the atomic load is well-defined.
+			// Overflow records publish their aligned header word with a release
+			// store. Acquire-load it before reading the payload, especially on arm64.
 			recLen = uint64(uint16(atomic.LoadUint64(s.u64(base))))
 		} else {
 			// SPSC rings: the acquire-load of write_pos above already orders
@@ -304,17 +266,9 @@ func (s *Segment) drainRing(r *ringState, isOverflow bool,
 
 	if rp != startRp {
 		if isOverflow {
-			// ABI v1.1 overflow-ring reader obligation: zero the ENTIRE
-			// consumed byte range [startRp, rp), not merely each record's len
-			// word. Record boundaries do not align across ring laps, so a
-			// lap-N+1 CAS reservation can begin at an offset that held lap-N
-			// record interior bytes; zeroing only the len words would leave
-			// those interior bytes non-zero, and a reader polling between the
-			// writer's reservation and its own zero-len step could read them
-			// as a bogus len and desync the ring. Zeroing the whole consumed
-			// range guarantees every reserved-but-unpublished byte reads zero,
-			// so the len==0-is-in-flight rule holds across laps. This must
-			// complete before the release-store of read_pos below.
+			// Clear every consumed byte before releasing read_pos. On a later lap,
+			// a record can start inside a previous payload, so clearing only headers
+			// would expose stale nonzero lengths in unpublished reservations.
 			s.zeroConsumed(r.dataOff, startRp, rp, rds, mask)
 		}
 		r.readPos = rp

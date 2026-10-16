@@ -3,28 +3,13 @@
 
 package reporter // import "go.opentelemetry.io/ebpf-profiler/reporter"
 
-// Process lineage for the local pprof egress: the parent pid, and the ancestor
-// chain up to a bounded depth.
-//
-// Why it is worth the /proc read. Container id groups samples by service, but a
-// service is not always one process: the BEAM spawns erl_child_setup and port
-// programs, and anything that shells out per request has its CPU sitting in
-// children that a per-pid view reports as unrelated noise and a per-service view
-// misses entirely. With lineage, "everything descended from this pid" is a
-// filter, so a service that spends its time in short-lived children still adds
-// up.
-//
-// Resolved at first sight rather than at sample time, and from /proc rather than
-// from a fork tracepoint: the agent already reads /proc per process, adding
-// `stat` is one more read, and it needs no eBPF change. The tradeoff is honest
-// and recorded: a process that dies before we look has no lineage, and a parent
-// that dies makes its children look like children of init. Both are visible --
-// unresolved lookups are counted, and the count belongs in any conclusion drawn
-// from an ancestry filter.
+// Resolve parent and ancestor PIDs from /proc when a process first appears.
+// An exited process may have no lineage; unresolved lookups are counted.
 
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -108,11 +93,11 @@ func (c *lineageCache) resolve(pid int) lineage {
 		chain = append(chain, next)
 		cur = next
 	}
-	for i := len(chain) - 1; i >= 0; i-- {
-		if chain[i] == 0 {
+	for _, pid := range slices.Backward(chain) {
+		if pid == 0 {
 			continue
 		}
-		l.ancestors = append(l.ancestors, chain[i])
+		l.ancestors = append(l.ancestors, pid)
 	}
 	return l
 }

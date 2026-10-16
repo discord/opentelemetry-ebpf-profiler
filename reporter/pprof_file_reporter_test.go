@@ -4,8 +4,11 @@
 package reporter
 
 import (
+	"context"
 	"os"
 	"path/filepath"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -15,18 +18,102 @@ import (
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
 	"go.opentelemetry.io/ebpf-profiler/reporter/samples"
-	"go.opentelemetry.io/ebpf-profiler/support"
 )
+
+func TestStopFlushesSamplesReceivedAfterContextCancellation(t *testing.T) {
+	dir := t.TempDir()
+	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
+	require.NoError(t, err)
+	ctx, cancel := context.WithCancel(t.Context())
+	require.NoError(t, r.Start(ctx))
+	tr := testTrace(t, "worker")
+	require.NoError(t, r.ReportTraceEvent(tr, meta(1, 1, 1, "worker", "app", "")))
+	cancel()
+	<-r.pprof.done
+	require.NoError(t, r.ReportTraceEvent(tr, meta(2, 1, 1, "worker", "app", "")))
+	r.Stop()
+
+	paths, err := filepath.Glob(filepath.Join(dir, "*.pb.gz"))
+	require.NoError(t, err)
+	require.Len(t, paths, 2)
+	for _, path := range paths {
+		data, err := os.ReadFile(path)
+		require.NoError(t, err)
+		p, err := profile.ParseData(data)
+		require.NoError(t, err)
+		require.Len(t, p.Sample, 1)
+	}
+	require.Error(t, r.ReportTraceEvent(tr, meta(3, 1, 1, "worker", "app", "")))
+}
+
+func TestProfileWriteFailureCountsLostSamples(t *testing.T) {
+	dir := t.TempDir()
+	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
+	require.NoError(t, err)
+	tr := testTrace(t, "worker")
+	require.NoError(t, r.ReportTraceEvent(tr, meta(1, 1, 1, "worker", "app", "")))
+	require.NoError(t, os.Remove(dir))
+	require.Error(t, r.Flush())
+	require.Equal(t, uint64(1), r.Dropped())
+
+	require.NoError(t, os.Mkdir(dir, 0o755))
+	require.NoError(t, r.ReportTraceEvent(tr, meta(2, 1, 1, "worker", "app", "")))
+	require.NoError(t, r.Flush())
+	p := readOne(t, dir)
+	require.Contains(t, strings.Join(p.Comments, "\n"), "dropped 1 samples")
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+}
+
+func TestProfileFilesPreserveDefaultCreationPermissions(t *testing.T) {
+	dir := t.TempDir()
+	probe, err := os.Create(filepath.Join(dir, "permissions"))
+	require.NoError(t, err)
+	info, err := probe.Stat()
+	require.NoError(t, err)
+	require.NoError(t, probe.Close())
+	require.NoError(t, os.Remove(probe.Name()))
+	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
+	require.NoError(t, err)
+	require.NoError(t, r.ReportTraceEvent(testTrace(t, "worker"), meta(1, 1, 1, "worker", "app", "")))
+	require.NoError(t, r.Flush())
+	paths, err := filepath.Glob(filepath.Join(dir, "*.pb.gz"))
+	require.NoError(t, err)
+	require.Len(t, paths, 1)
+	profileInfo, err := os.Stat(paths[0])
+	require.NoError(t, err)
+	require.Equal(t, info.Mode().Perm(), profileInfo.Mode().Perm())
+}
+
+func TestEventDrivenProfilesDoNotAddPeriodicCPUTime(t *testing.T) {
+	dir := t.TempDir()
+	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
+	require.NoError(t, err)
+	for _, typ := range []*samples.TypeMetadata{profileTypeSampling, profileTypeProbe, profileTypeOffCPU} {
+		m := meta(1, 1, 1, "worker", "app", "")
+		m.ProfileType = typ
+		m.Value = 1234
+		require.NoError(t, r.ReportTraceEvent(testTrace(t, "worker"), m))
+	}
+	require.NoError(t, r.Flush())
+	p := readOne(t, dir)
+	require.Len(t, p.Sample, 3)
+	require.Equal(t, int64(10_000_000), p.Sample[0].Value[1])
+	require.Zero(t, p.Sample[1].Value[1])
+	require.Zero(t, p.Sample[2].Value[1])
+	require.Equal(t, []int64{1234}, p.Sample[2].NumLabel[LabelOffTimeNs])
+}
 
 func testTrace(t *testing.T, names ...string) *libpf.Trace {
 	t.Helper()
 	tr := &libpf.Trace{}
 	// Frames arrive leaf first from the tracer.
-	for i := len(names) - 1; i >= 0; i-- {
+	for i, name := range slices.Backward(names) {
 		tr.Frames.Append(&libpf.Frame{
 			Type:            libpf.NativeFrame,
-			FunctionName:    libpf.Intern(names[i]),
-			SourceFile:      libpf.Intern(names[i] + ".erl"),
+			FunctionName:    libpf.Intern(name),
+			SourceFile:      libpf.Intern(name + ".erl"),
 			SourceLine:      libpf.SourceLineno(10 + i),
 			AddressOrLineno: libpf.AddressOrLineno(0x1000 + i),
 		})
@@ -38,14 +125,14 @@ func meta(ktime int64, pid, tid libpf.PID, comm, process, container string) *sam
 	return &samples.TraceEventMeta{
 		Timestamp:      libpf.UnixTime64(1_700_000_000_000_000_000 + ktime),
 		KTime:          ktime,
-		Comm:           libpf.Intern(comm),
+		Comm:           libpf.NewCommFromString(comm),
 		ProcessName:    libpf.Intern(process),
 		ExecutablePath: libpf.Intern("/usr/lib/erlang/bin/" + process),
 		ContainerID:    libpf.Intern(container),
 		PID:            pid,
 		TID:            tid,
 		CPU:            3,
-		Origin:         support.TraceOriginSampling,
+		ProfileType:    profileTypeSampling,
 	}
 }
 
@@ -62,15 +149,13 @@ func readOne(t *testing.T, dir string) *profile.Profile {
 	return p
 }
 
-// Identical stacks must stay separate samples: a window is defined by
-// per-sample timestamps, so aggregation would make windows undefinable.
 func TestPprofFileReporterDoesNotAggregate(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 1000})
 	require.NoError(t, err)
 
 	tr := testTrace(t, "caller", "callee")
-	for i := int64(0); i < 5; i++ {
+	for i := range int64(5) {
 		require.NoError(t, r.ReportTraceEvent(tr, meta(1_000+i, 100, 101, "erts_sched_1", "beam.smp", "abc123")))
 	}
 	require.NoError(t, r.Flush())
@@ -89,8 +174,6 @@ func TestPprofFileReporterDoesNotAggregate(t *testing.T) {
 	assert.Len(t, seen, 5, "each sample must carry its own kernel timestamp")
 }
 
-// The whole label contract has to survive to the file, since nothing downstream
-// can reconstruct a label that was never written.
 func TestPprofFileReporterWritesTheLabelContract(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 997})
@@ -120,12 +203,6 @@ func TestPprofFileReporterWritesTheLabelContract(t *testing.T) {
 	assert.NotEqual(t, s.NumLabel[LabelKTimeNs], s.NumLabel[LabelTimestampNs])
 }
 
-// /proc/PID/comm ends in a newline and process.GetProcessMeta interns it
-// verbatim, so ProcessName arrives here as "beam.smp\n". Emitting that means
-// every offline filter on the documented label value ("-process-name beam.smp")
-// matches nothing, and a grouping key carries an embedded newline -- a silent
-// empty result rather than an error. Trim at the seam where the contract is
-// defined.
 func TestPprofFileReporterTrimsProcessName(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 997})
@@ -140,8 +217,6 @@ func TestPprofFileReporterTrimsProcessName(t *testing.T) {
 	assert.Equal(t, []string{"beam.smp"}, p.Sample[0].Label[LabelProcessName])
 }
 
-// pprof stores stacks leaf first; the frames the tracer delivers are already in
-// that order, and the file must preserve it so root-first folding is correct.
 func TestPprofFileReporterPreservesStackOrder(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
@@ -160,8 +235,6 @@ func TestPprofFileReporterPreservesStackOrder(t *testing.T) {
 	assert.Equal(t, []string{"leaf", "middle", "root"}, names)
 }
 
-// An unsymbolized native frame still has to be distinguishable from another
-// one, or unrelated stacks collapse together and coverage is overstated.
 func TestPprofFileReporterNamesUnsymbolizedFrames(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
@@ -182,9 +255,6 @@ func TestPprofFileReporterNamesUnsymbolizedFrames(t *testing.T) {
 	assert.Equal(t, "0x1111", first)
 }
 
-// TestPprofFileReporterSeparatesCPUAndAllocColumns pins the mixing bug dead:
-// a CPU sample's period-ns value and a beamscope alloc sample's word count
-// must land in their own SampleType columns, not share column 1.
 func TestPprofFileReporterSeparatesCPUAndAllocColumns(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
@@ -194,9 +264,8 @@ func TestPprofFileReporterSeparatesCPUAndAllocColumns(t *testing.T) {
 	require.NoError(t, r.ReportTraceEvent(testTrace(t, "a"), cpuMeta))
 
 	allocMeta := meta(2, 1, 1, "c", "p", "k")
-	allocMeta.Origin = support.TraceOriginBeamScope
 	allocMeta.Value = 12_345
-	allocMeta.ValueKind = samples.ValueKindAlloc
+	allocMeta.ProfileType = samples.BeamScopeProfile(samples.ValueKindAlloc)
 	require.NoError(t, r.ReportTraceEvent(testTrace(t, "a"), allocMeta))
 
 	require.NoError(t, r.Flush())
@@ -221,8 +290,6 @@ func TestPprofFileReporterSeparatesCPUAndAllocColumns(t *testing.T) {
 	assert.Equal(t, int64(12_345), allocValue)
 }
 
-// TestPprofFileReporterKeepsCustomLabelsForCPUOrigin: custom labels are not
-// gated to beamscope any more (Task 8 needs them on every origin).
 func TestPprofFileReporterKeepsCustomLabelsForCPUOrigin(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
@@ -239,16 +306,13 @@ func TestPprofFileReporterKeepsCustomLabelsForCPUOrigin(t *testing.T) {
 	assert.Equal(t, []string{"y"}, p.Sample[0].Label["x"])
 }
 
-// TestPprofFileReporterMsgSampleInColumnFour pins the msgs column and the
-// "msg" beamscope_kind label value.
 func TestPprofFileReporterMsgSampleInColumnFour(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
 	require.NoError(t, err)
 	m := meta(1, 1, 1, "c", "p", "k")
-	m.Origin = support.TraceOriginBeamScope
 	m.Value = 640
-	m.ValueKind = samples.ValueKindMsgs
+	m.ProfileType = samples.BeamScopeProfile(samples.ValueKindMsgs)
 	tr := testTrace(t, "a")
 	tr.CustomLabels = map[libpf.String]libpf.String{
 		libpf.Intern("beamscope_kind"): libpf.Intern("msg"),
@@ -296,14 +360,12 @@ func TestPprofFileReporterFiltersByPIDAndComm(t *testing.T) {
 	assert.Equal(t, []string{"erts_sched_1"}, p2.Sample[0].Label[LabelComm])
 }
 
-// Truncation must be visible in the artifact: a lossy window that reads as a
-// quiet one is worse than an error.
 func TestPprofFileReporterReportsDrops(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100, MaxBufferedSamples: 2})
 	require.NoError(t, err)
 	tr := testTrace(t, "a")
-	for i := int64(0); i < 5; i++ {
+	for i := range int64(5) {
 		require.NoError(t, r.ReportTraceEvent(tr, meta(i+1, 1, 1, "c", "p", "k")))
 	}
 	assert.Equal(t, uint64(3), r.Dropped())
@@ -320,8 +382,8 @@ func TestPprofFileReporterRejectsUnknownOrigin(t *testing.T) {
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
 	require.NoError(t, err)
 	m := meta(1, 1, 1, "c", "p", "k")
-	m.Origin = libpf.Origin(200)
-	assert.ErrorIs(t, r.ReportTraceEvent(testTrace(t, "a"), m), errUnknownOrigin)
+	m.ProfileType = nil
+	assert.ErrorIs(t, r.ReportTraceEvent(testTrace(t, "a"), m), errUnknownProfileType)
 }
 
 func TestPprofFileReporterFlushWithNothingBufferedWritesNoFile(t *testing.T) {
@@ -336,13 +398,11 @@ func TestPprofFileReporterFlushWithNothingBufferedWritesNoFile(t *testing.T) {
 
 func TestNewPprofFileValidatesConfig(t *testing.T) {
 	_, err := NewLocalEgress(LocalEgressConfig{SamplesPerSecond: 100})
-	assert.Error(t, err, "a reporter with no directory cannot write anything")
+	require.Error(t, err, "a reporter with no directory cannot write anything")
 	_, err = NewLocalEgress(LocalEgressConfig{Dir: t.TempDir()})
 	assert.Error(t, err, "a zero sample rate would scale every value wrongly")
 }
 
-// Start/Stop must flush what is buffered, or the last window of a campaign is
-// silently lost.
 func TestPprofFileReporterStopFlushes(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100, FlushInterval: time.Hour})
@@ -355,11 +415,6 @@ func TestPprofFileReporterStopFlushes(t *testing.T) {
 	assert.Len(t, p.Sample, 1)
 }
 
-// google/pprof drops a numeric label that is both zero-valued and unit-less, so an
-// unlabelled `cpu` silently loses every sample taken on CPU 0 -- ~1/16 of a 16-core
-// box, arriving downstream as "no cpu label" rather than "cpu 0". A capture taken
-// before the fix had distinct cpu values 1..15 with 0 absent and 95.3% coverage.
-// The label survives a real round-trip only because it carries a unit.
 func TestPprofFileReporterKeepsZeroValuedIdentifierLabels(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 997})
@@ -379,11 +434,6 @@ func TestPprofFileReporterKeepsZeroValuedIdentifierLabels(t *testing.T) {
 	assert.Equal(t, []string{unitID}, s.NumUnit[LabelTID])
 }
 
-// Task 8: a CPU-origin sample whose tid mapped to a BEAM scheduler carries the
-// raw Erlang pid term as a numeric label. It is the join key against every
-// beam_scope JSONL record, so it must round-trip through the pprof encoder
-// exactly -- including the high bits of a 64-bit Eterm -- and must carry a
-// unit for the same reason `cpu` does.
 func TestPprofFileReporterErlangPidKeyLabel(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 997})
@@ -401,28 +451,24 @@ func TestPprofFileReporterErlangPidKeyLabel(t *testing.T) {
 
 	p := readOne(t, dir)
 	require.Len(t, p.Sample, 2)
-	var labelled, bare *profile.Sample
+	var labeled, bare *profile.Sample
 	for _, s := range p.Sample {
 		if s.NumLabel[LabelKTimeNs][0] == 7_777 {
-			labelled = s
+			labeled = s
 		} else {
 			bare = s
 		}
 	}
-	require.NotNil(t, labelled)
+	require.NotNil(t, labeled)
 	require.NotNil(t, bare)
 
-	require.Contains(t, labelled.NumLabel, LabelErlangPidKey)
-	assert.Equal(t, []int64{0xABCD}, labelled.NumLabel[LabelErlangPidKey])
-	assert.Equal(t, []string{unitID}, labelled.NumUnit[LabelErlangPidKey])
+	require.Contains(t, labeled.NumLabel, LabelErlangPidKey)
+	assert.Equal(t, []int64{0xABCD}, labeled.NumLabel[LabelErlangPidKey])
+	assert.Equal(t, []string{unitID}, labeled.NumUnit[LabelErlangPidKey])
 	assert.NotContains(t, bare.NumLabel, LabelErlangPidKey,
 		"a non-scheduler thread must carry no erlang_pid_key at all")
 }
 
-// The label is an unsigned Eterm travelling through pprof's signed num-label
-// field. The observed OTP 25 term 0x278000004f3 does not exercise that, so
-// this pins the carrier itself with the sign bit set: an int64 round trip must
-// not corrupt or drop a single bit.
 func TestPprofFileReporterErlangPidKeyHighBits(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 997})
@@ -439,11 +485,6 @@ func TestPprofFileReporterErlangPidKeyHighBits(t *testing.T) {
 	assert.Equal(t, term, uint64(s.NumLabel[LabelErlangPidKey][0]))
 }
 
-// The kernel's comm for a BEAM main thread genuinely contains a trailing
-// newline, so an untrimmed comm label splits one process into two when
-// grouped. Threads the VM renamed via pthread_setname_np ("1_scheduler") do
-// not carry it, which is why the problem shows up on exactly one thread per VM
-// and is easy to miss.
 func TestPprofFileReporterTrimsCommWhitespace(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 997})
@@ -467,8 +508,6 @@ func TestPprofFileReporterTrimsCommWhitespace(t *testing.T) {
 	assert.NotContains(t, seen, "beam.smp\n")
 }
 
-// KeepComms filters on the same string, so trimming has to happen before it or
-// a caller passing "beam.smp" would silently match nothing for the main thread.
 func TestPprofFileReporterKeepCommsMatchesTrimmedComm(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{
@@ -482,11 +521,6 @@ func TestPprofFileReporterKeepCommsMatchesTrimmedComm(t *testing.T) {
 	assert.Len(t, readOne(t, dir).Sample, 1)
 }
 
-// numLabelUnits names BEAMSCOPE's numeric custom labels. Once the custom-label
-// loop stopped being gated to beamscope, it applied that mapping to every
-// origin -- so an ordinary Go service that sets a pprof label called "preempts"
-// (or yields, nswitches, pause_ns, mbuf_words) silently got a NUMERIC label
-// with unit "count" instead of the string label it asked for.
 func TestPprofFileReporterDoesNotRetypeCustomLabelsForNonBeamscopeOrigins(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
@@ -504,7 +538,7 @@ func TestPprofFileReporterDoesNotRetypeCustomLabelsForNonBeamscopeOrigins(t *tes
 		libpf.Intern("preempts"): libpf.Intern("17"),
 	}
 	m := meta(2, 1, 1, "c", "p", "k")
-	m.Origin = support.TraceOriginBeamScope
+	m.ProfileType = samples.BeamScopeProfile(samples.ValueKindAlloc)
 	require.NoError(t, r.ReportTraceEvent(bs, m))
 	require.NoError(t, r.Flush())
 
@@ -530,10 +564,6 @@ func TestPprofFileReporterDoesNotRetypeCustomLabelsForNonBeamscopeOrigins(t *tes
 	assert.NotContains(t, beamscope.Label, "preempts")
 }
 
-// The custom-label loop runs after the contract labels are assigned, so an
-// un-guarded loop lets the traced process overwrite this reporter's own values.
-// A filter on `comm` or `origin` has to mean the kernel's comm and this
-// reporter's origin, whatever a Go service puts in its pprof labels.
 func TestPprofFileReporterCustomLabelsCannotOverwriteTheContract(t *testing.T) {
 	dir := t.TempDir()
 	r, err := NewLocalEgress(LocalEgressConfig{Dir: dir, SamplesPerSecond: 100})
@@ -563,9 +593,6 @@ func TestPprofFileReporterCustomLabelsCannotOverwriteTheContract(t *testing.T) {
 	assert.NotContains(t, s.Label, LabelKTimeNs)
 }
 
-// originTable is the single source of truth behind the validity check, the
-// pprof origin label and the socket wire byte. A new origin that reaches only
-// two of the three is the bug the table exists to prevent.
 func TestOriginTableCoversAllThreeConsumers(t *testing.T) {
 	for origin, want := range originTable {
 		assert.Equal(t, want.name, originName(origin))
@@ -574,7 +601,7 @@ func TestOriginTableCoversAllThreeConsumers(t *testing.T) {
 			"a valid origin must have a wire byte of its own")
 	}
 	assert.Len(t, originTable, 4)
-	unknown := libpf.Origin(200)
+	unknown := sampleOrigin(200)
 	assert.Equal(t, "origin_200", originName(unknown))
 	assert.Equal(t, socketOriginUnknown, socketOrigin(unknown))
 }

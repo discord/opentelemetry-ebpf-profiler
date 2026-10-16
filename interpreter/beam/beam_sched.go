@@ -3,23 +3,9 @@
 
 package beam // import "go.opentelemetry.io/ebpf-profiler/interpreter/beam"
 
-// Per-sample Erlang process attribution (Discord addition).
-//
-// This is the user-space half of the erlang_pid_key label. It answers three
-// questions for one BEAM process, once, at attach time:
-//
-//  1. which kernel tids are scheduler threads (from /proc/<pid>/task/*/comm),
-//  2. where each of those threads' ErtsSchedulerData lives, and
-//  3. where current_process sits inside it.
-//
-// The answers go into the beam_sched_tids eBPF map, and support/ebpf/
-// beam_sched.h then does nothing but two pointer reads and a tag check on the
-// sampling path. Keeping all version knowledge here is deliberate: the eBPF
-// side has no way to fail safely, so it must never be given a choice.
-//
-// Nothing here is allowed to be fatal. The label is an enrichment; if any step
-// is not certain, the feature is disabled for that process and BEAM unwinding
-// carries on unchanged.
+// Resolve scheduler threads and validate their memory layout at attach time.
+// The eBPF sampler uses these addresses to identify the running Erlang process.
+// Validation failures disable attribution without affecting stack unwinding.
 
 import (
 	"fmt"
@@ -44,14 +30,8 @@ const (
 	// https://github.com/erlang/otp/blob/OTP-25.3.2.7/erts/emulator/beam/erl_alloc.h
 	ertsCacheLineSize = 64
 
-	// maxAlignedStride bounds the stride probe. sizeof(ErtsSchedulerData) is
-	// dominated by ErtsAuxWorkData and ErtsAtomCacheMap and measured at 41728
-	// bytes on OTP 25.3.2.7 (nix, x86_64); 256 KiB leaves a wide margin for
-	// other builds. The probe cannot stop at the first match (acceptance
-	// requires uniqueness), so this is 4096 candidates every time, each
-	// normally costing one 8-byte read. Paid once per BEAM process, for the
-	// normal array only -- the dirty array is a single verification pass at
-	// the stride this measured -- and under the ProcessManager write lock.
+	// maxAlignedStride bounds the 64-byte-step search for the scheduler stride.
+	// The struct size depends on OTP build options; validate it against the live VM.
 	maxAlignedStride = 1 << 18
 
 	// maxSchedulersPerVM sanity-bounds erts_no_schedulers before it is used as
@@ -214,18 +194,7 @@ func resolveSymbols(ef *pfelf.File) resolvedSymbols {
 	var out resolvedSymbols
 	const wanted = 5
 	found := 0
-	// found must count DISTINCT symbols RESOLVED, not matches: the four sched
-	// cases are guarded on "slot still zero", which stays true when a matched
-	// .symtab entry's address is genuinely 0 (an undefined or weak entry), so
-	// counting matches would let duplicate entries for such a name drive found
-	// to wanted with only four names resolved -- ending the pass early and
-	// possibly before "r" is seen, which is fatal (no r, no BEAM interpreter)
-	// rather than merely a lost enrichment label. The zero-valued slot IS the
-	// not-yet-resolved bit, so setSched only bumps found on the zero ->
-	// non-zero transition: duplicate names resolve FIRST-NON-ZERO-wins, chosen
-	// deliberately over first-wins (which would latch a useless 0 and stop
-	// looking) and over last-wins (which would let a later undefined entry
-	// undo a good address).
+	// Count each distinct symbol once: ELF symbol tables may contain duplicates.
 	setSched := func(dst *libpf.Address, addr libpf.SymbolValue) {
 		if addr == 0 {
 			return
@@ -253,23 +222,9 @@ func resolveSymbols(ef *pfelf.File) resolvedSymbols {
 	return out
 }
 
-// parseSchedComm classifies a thread comm.
-//
-// The emulator names its threads "<N>_scheduler", "<N>_dirty_cpu_scheduler"
-// and "<N>_dirty_io_scheduler" (erl_process.c, erts_snprintf(opts.name, ...)),
-// and Linux truncates comm to TASK_COMM_LEN-1 = 15 bytes. Observed on OTP
-// 25.3.2.7 / erts-13.2.2.4, x86_64, `erl +S 4:4 +SDcpu 2:2`:
-//
-//	1_scheduler  2_scheduler  3_scheduler  4_scheduler
-//	1_dirty_cpu_sch  2_dirty_cpu_sch
-//	1_dirty_io_sche  ...  10_dirty_io_sch
-//	1_aux  0_poller  async_1  sys_sig_dispatc  beam.smp
-//
-// So the dirty names arrive truncated and must be matched as a prefix, while
-// the normal ones do not (they only truncate above 99999 schedulers, which
-// this rejects rather than guesses about). The prefix must be long enough to
-// separate "dirty_cpu" from "dirty_io" -- mistaking one for the other would
-// index the wrong half of a shared allocation.
+// parseSchedComm recognizes normal and dirty-CPU scheduler names. Linux
+// truncates comm to 15 bytes, so the dirty suffix may be a prefix; it must
+// still distinguish dirty-CPU from dirty-IO threads.
 func parseSchedComm(comm string) (schedKind, uint32) {
 	const (
 		normalSuffix      = "scheduler"
@@ -297,21 +252,8 @@ func parseSchedComm(comm string) (schedKind, uint32) {
 	return schedKindNone, 0
 }
 
-// scanSchedulerThreads lists the BEAM scheduler threads of one process.
-//
-// Scheduler threads are created during VM startup, before any Erlang code (let
-// alone a NIF) runs, and are never added or removed at runtime, so one scan at
-// attach is complete. procRoot is "/proc" outside tests.
-//
-// Known limitation (documented, not implemented): this scan runs exactly once,
-// at attach, and is never repeated. If attach lands while the VM is still in
-// the middle of creating its scheduler threads, threads that appear after the
-// scan never get a beam_sched_tids entry, and because this call still returns
-// at least one thread, enableSchedAttribution's zero-threads warning does not
-// fire either -- attribution is silently partial for that process (missing
-// labels on the late threads, never wrong ones on any thread). If this ever
-// matters in practice, the fix is a re-scan (e.g. triggered off
-// SynchronizeMappings), not a change here.
+// scanSchedulerThreads lists scheduler threads under procRoot. This runs once
+// at attach, so threads created later are not attributed.
 func scanSchedulerThreads(procRoot string, pid libpf.PID) []schedThread {
 	taskDir := filepath.Join(procRoot, strconv.Itoa(int(pid)), "task")
 	entries, err := os.ReadDir(taskDir)
@@ -338,25 +280,9 @@ func scanSchedulerThreads(procRoot string, pid libpf.PID) []schedThread {
 	return out
 }
 
-// checkSchedArray verifies the init_scheduler_data invariant over elements
-// [from, n) of a scheduler array laid out at the given stride.
-//
-// The invariant is set at VM start and never changes (erl_process.c
-// init_scheduler_data, called as init_scheduler_data(esdp, ix+1, ...) for
-// every ix, OTP-25.3.2.7 L5912-L5934). It gives TWO constraints per element,
-// not one -- whichever of the two number fields is the index, the other is
-// explicitly zeroed:
-//
-//	normal     esdp[i]:  .no == i+1        AND  .dirty_no == 0  (L5931-L5932)
-//	dirty-CPU  esdp[i]:  .dirty_no == i+1  AND  .no == 0        (L5913, L5920)
-//
-// Both are checked for both arrays. Leaning on the index field alone would
-// leave a 2-element array resting on a single predicate ("some 64-aligned word
-// equals 2"), asked of hundreds of words inside element 0's own struct, where
-// a small integer 2 is entirely plausible.
-//
-// A failed remote read yields 0 from rm, which fails the index comparison.
-// That is the intended direction: unreadable means disabled.
+// checkSchedArray validates scheduler numbering over [from, n): normal
+// schedulers have no=i+1 and dirty_no=0; dirty-CPU schedulers reverse these.
+// The fields are initialized once by OTP's init_scheduler_data.
 func checkSchedArray(rm remotememory.RemoteMemory, base libpf.Address, from, n, stride uint32,
 	offs schedOffsets, kind schedKind) error {
 	num, zero := offs.forKind(kind)
@@ -373,27 +299,9 @@ func checkSchedArray(rm remotememory.RemoteMemory, base libpf.Address, from, n, 
 	return nil
 }
 
-// probeAlignedStride measures sizeof(ErtsAlignedSchedulerData) against a live
-// VM, and is the tripwire that gates the whole feature.
-//
-// It walks 64-byte-aligned candidate strides (ERTS_ALC_CACHE_LINE_ALIGN_SIZE)
-// and requires checkSchedArray to hold across the whole array. Acceptance
-// requires UNIQUENESS: the entire candidate range is scanned and the result is
-// accepted only if exactly one stride satisfies the invariant. Two matches is
-// a clean disable, not a coin flip.
-//
-// Uniqueness cannot reject the true stride S *of a homogeneous array*: any
-// multiple k*S reads element k*i at index i, whose index field is k*i+1, which
-// differs from i+1 for every i >= 1. A second match can then only be an
-// unrelated coincidence -- which is exactly the thing that must not be
-// silently resolved in favour of a guess.
-//
-// "Homogeneous" is load-bearing and is why callers must only run this against
-// erts_aligned_scheduler_data. See dirtyArrayAliasing below.
-//
-// n == 1 carries no discriminating information, but also needs none: only
-// element 0 is ever addressed, and it is still checked against both
-// constraints.
+// probeAlignedStride accepts exactly one 64-byte-aligned stride satisfying
+// the numbering invariant across the normal scheduler array. A single-element
+// array needs no stride because only element zero is addressed.
 func probeAlignedStride(rm remotememory.RemoteMemory, base libpf.Address, n uint32,
 	offs schedOffsets, kind schedKind) (uint32, error) {
 	if base == 0 {
@@ -434,27 +342,9 @@ func probeAlignedStride(rm remotememory.RemoteMemory, base libpf.Address, n uint
 	return found, nil
 }
 
-// verifyDirtyCPUArray tripwires the dirty-CPU array at a stride measured
-// elsewhere, because the dirty array must NOT be probed on its own.
-//
-// erts_aligned_scheduler_data is exactly erts_no_schedulers elements indexed
-// 1..n with no gaps -- homogeneous, so probeAlignedStride's uniqueness
-// argument holds there. The dirty arrays are not: both live in ONE allocation
-// of (no_dirty_cpu + no_dirty_io) elements, with
-//
-//	erts_aligned_dirty_io_scheduler_data = &erts_aligned_dirty_cpu_scheduler_data[no_dirty_cpu]
-//
-// (erl_process.c L6193-L6212 @OTP-25.3.2.7), and the IO half RESTARTS
-// dirty_no at 1. Probing the dirty-CPU array therefore has a SYSTEMATIC false
-// match at k = no_dirty_cpu + 1: element k is dirty_io[1], whose dirty_no is 2
-// and whose no is 0 -- indistinguishable from dirty_cpu[1] by any local test.
-// Observed on a real VM at `+SDcpu 2:2` (10 dirty-IO schedulers by default):
-// strides 41728 and 125184 == 3*41728 both satisfied the invariant, and the
-// uniqueness rule correctly refused to choose.
-//
-// Both arrays are the same struct, so the stride measured on the homogeneous
-// array is authoritative for this one. The dirty array still gets a full
-// tripwire, just at a known stride rather than a searched one.
+// verifyDirtyCPUArray validates dirty-CPU data at the normal array's stride.
+// Do not search this array independently: dirty-IO data shares the allocation
+// and restarts dirty_no at 1, creating false stride matches.
 func verifyDirtyCPUArray(rm remotememory.RemoteMemory, base libpf.Address, n, normalStride uint32,
 	offs schedOffsets) error {
 	if base == 0 {
@@ -500,6 +390,12 @@ func (d *beamData) warnSchedUnsupportedOnce(format string, args ...any) {
 	})
 }
 
+// beamSchedHandler is optional so custom eBPF handlers need not implement attribution.
+type beamSchedHandler interface {
+	UpdateBeamSchedTid(libpf.PID, support.BeamSchedInfo) error
+	DeleteBeamSchedTid(libpf.PID, libpf.PID) error
+}
+
 // enableSchedAttribution populates beam_sched_tids for one BEAM process and
 // returns the tids it wrote, for Detach to remove.
 //
@@ -508,6 +404,10 @@ func (d *beamData) warnSchedUnsupportedOnce(format string, args ...any) {
 // partially-populated one.
 func (d *beamData) enableSchedAttribution(ebpf interpreter.EbpfHandler, pid libpf.PID,
 	bias libpf.Address, rm remotememory.RemoteMemory) []libpf.PID {
+	handler, ok := ebpf.(beamSchedHandler)
+	if !ok {
+		return nil
+	}
 	offs, ok := lookupSchedOffsets(d.otpRelease)
 	if !ok {
 		d.warnSchedUnsupportedOnce("no ErtsSchedulerData layout for OTP %d", d.otpRelease)
@@ -522,7 +422,7 @@ func (d *beamData) enableSchedAttribution(ebpf interpreter.EbpfHandler, pid libp
 	// limitation that creates.
 	threads := scanSchedulerThreads(procFSRoot, pid)
 	if len(threads) == 0 {
-		// A beam.smp with no recognisable scheduler threads should not happen
+		// A beam.smp with no recognizable scheduler threads should not happen
 		// -- they exist before any Erlang code runs -- so this is a silent
 		// loss of the feature for a VM that looks fully supported. Warn.
 		log.Warnf("BEAM PID %d: no scheduler threads found in %s, per-sample "+
@@ -573,7 +473,7 @@ func (d *beamData) enableSchedAttribution(ebpf interpreter.EbpfHandler, pid libp
 			continue
 		}
 		info := beamSchedInfoFor(arr, offs, th.num, pid)
-		if err := ebpf.UpdateBeamSchedTid(libpf.PID(th.tid), info); err != nil {
+		if err := handler.UpdateBeamSchedTid(libpf.PID(th.tid), info); err != nil {
 			log.Warnf("BEAM PID %d: failed to map scheduler tid %d: %v", pid, th.tid, err)
 			continue
 		}
@@ -591,15 +491,8 @@ func (d *beamData) enableSchedAttribution(ebpf interpreter.EbpfHandler, pid libp
 	return written
 }
 
-// beamSchedInfoFor builds the map value for one scheduler thread: the address
-// of its ErtsSchedulerData, the offset the eBPF side reads from it, and the
-// tgid the entry belongs to.
-//
-// The tgid is not decoration: see support/ebpf/beam_sched.h's identity
-// section for why the map value must be bound to it.
-//
-// num is 1-based, so element num-1 is addressed; when the stride was not
-// measured (single-scheduler VM) num is necessarily 1 and the product is zero.
+// beamSchedInfoFor addresses scheduler num-1 and binds the entry to its tgid.
+// A single-scheduler VM may use a zero stride.
 func beamSchedInfoFor(arr *schedArray, offs schedOffsets, num uint32,
 	tgid libpf.PID) support.BeamSchedInfo {
 	return support.BeamSchedInfo{
@@ -631,8 +524,12 @@ func countRunningProcesses(rm remotememory.RemoteMemory, arr *schedArray,
 // beam_sched_tids, conditioned on tgid: see support/ebpf/beam_sched.h's
 // identity section for why the delete cannot be unconditional.
 func disableSchedAttribution(ebpf interpreter.EbpfHandler, tids []libpf.PID, tgid libpf.PID) {
+	handler, ok := ebpf.(beamSchedHandler)
+	if !ok {
+		return
+	}
 	for _, tid := range tids {
-		if err := ebpf.DeleteBeamSchedTid(tid, tgid); err != nil {
+		if err := handler.DeleteBeamSchedTid(tid, tgid); err != nil {
 			log.Debugf("BEAM: failed to unmap scheduler tid %d: %v", tid, err)
 		}
 	}
