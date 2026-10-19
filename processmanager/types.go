@@ -159,6 +159,10 @@ type Mapping struct {
 
 	// FrameMapping data for this mapping.
 	FrameMapping libpf.FrameMapping
+
+	// PendingInterpreter is retained after a failed per-process attachment so it can
+	// be retried even when the executable mapping itself has not changed.
+	PendingInterpreter interpreter.Data
 }
 
 // GetOnDiskFileIdentifier returns the OnDiskFileIdentifier for the mapping

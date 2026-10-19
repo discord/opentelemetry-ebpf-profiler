@@ -22,6 +22,7 @@ import (
 	pmebpf "go.opentelemetry.io/ebpf-profiler/processmanager/ebpfapi"
 	"go.opentelemetry.io/ebpf-profiler/remotememory"
 	"go.opentelemetry.io/ebpf-profiler/reporter"
+	"go.opentelemetry.io/ebpf-profiler/support"
 	"go.opentelemetry.io/ebpf-profiler/times"
 	"go.opentelemetry.io/ebpf-profiler/util"
 )
@@ -429,6 +430,67 @@ func TestSynchronizeProcessUpdatesAnonymousMappingInterest(t *testing.T) {
 		fileID uint64
 		bias   uint64
 	}{{pid: pid, prefix: dummyPrefix}}, ebpf.pidPageMappingInfoUpdates)
+}
+
+func TestSynchronizeProcessRetriesInterpreterAttachmentForUnchangedMapping(t *testing.T) {
+	pid := libpf.PID(123)
+	oid := util.OnDiskFileIdentifier{DeviceID: 1, InodeNum: 2}
+	fileMapping := process.RawMapping{
+		Vaddr: 0x3000, Length: 0x1000, Flags: elf.PF_R | elf.PF_X,
+		Device: oid.DeviceID, Inode: oid.InodeNum, Path: "/tmp/beam.smp",
+	}
+	jitMapping := process.RawMapping{
+		Vaddr: 0x8000, Length: 0x1000, Flags: elf.PF_R | elf.PF_X,
+	}
+	instance := &TestInstance{usesAnonymousMappings: true}
+	attachAttempts := 0
+	data := &testInterpreterData{attach: func(_ interpreter.EbpfHandler, gotPID libpf.PID,
+		bias libpf.Address, _ remotememory.RemoteMemory) (interpreter.Instance, error) {
+		attachAttempts++
+		require.Equal(t, pid, gotPID)
+		require.Equal(t, libpf.Address(0x2000), bias)
+		if attachAttempts == 1 {
+			return nil, errors.New("runtime not initialized")
+		}
+		return instance, nil
+	}}
+	frameMapping := libpf.NewFrameMapping(libpf.FrameMappingData{
+		File: libpf.NewFrameMappingFile(libpf.FrameMappingFileData{
+			FileID: libpf.NewFileID(1, 0), FileName: libpf.Intern("beam.smp"),
+		}),
+		Start: 0x1000, End: 0x2000,
+	})
+	ebpf := &testEbpfHandler{}
+	pm := &ProcessManager{
+		ebpf:                     ebpf,
+		interpreterTracerEnabled: true,
+		interpreters:             make(map[libpf.PID]map[util.OnDiskFileIdentifier]interpreter.Instance),
+		pidToProcessInfo: map[libpf.PID]*processInfo{
+			pid: {mappings: []Mapping{{
+				Vaddr: libpf.Address(fileMapping.Vaddr), Length: fileMapping.Length,
+				Device: oid.DeviceID, Inode: oid.InodeNum,
+				FrameMapping: frameMapping, PendingInterpreter: data,
+			}}},
+		},
+		exitEvents: make(map[libpf.PID]times.KTime),
+	}
+	pr := &testProcess{pid: pid, mappings: []process.RawMapping{jitMapping, fileMapping}}
+
+	pm.SynchronizeProcess(pr)
+	require.Equal(t, 1, attachAttempts)
+	require.Empty(t, pm.interpreters[pid])
+	require.Same(t, data, pm.pidToProcessInfo[pid].mappings[0].PendingInterpreter)
+
+	pm.SynchronizeProcess(pr)
+	require.Equal(t, 2, attachAttempts)
+	require.Same(t, instance, pm.interpreters[pid][oid])
+	require.Nil(t, pm.pidToProcessInfo[pid].mappings[0].PendingInterpreter)
+	require.Equal(t, []process.RawMapping{jitMapping}, instance.syncMappings)
+	require.Equal(t, uint64(support.PIDPageMappingInfoFlagUsesAnonymousMappings),
+		ebpf.pidPageMappingInfoUpdates[len(ebpf.pidPageMappingInfoUpdates)-1].fileID)
+
+	pm.SynchronizeProcess(pr)
+	require.Equal(t, 2, attachAttempts)
 }
 
 func TestSynchronizeProcessSkipsDllMappingsWithoutAnonymousMappingInterest(t *testing.T) {
