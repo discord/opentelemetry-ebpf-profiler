@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"io"
+	"maps"
 	"math"
 
 	"go.opentelemetry.io/ebpf-profiler/libpf"
@@ -41,7 +42,7 @@ func findOTP25GlobalJITRanges(rm remotememory.RemoteMemory, descriptor libpf.Add
 		wanted[fragment] = struct{}{}
 	}
 	var err error
-	for attempt := 0; attempt < 3; attempt++ {
+	for range 3 {
 		var allocation otp25JITRange
 		found := make(map[string]otp25JITRange, len(wanted))
 		err = walkOTP25JIT(rm, descriptor, func(blobAddr libpf.Address, size uint64, header []byte) (bool, error) {
@@ -53,9 +54,7 @@ func findOTP25GlobalJITRanges(rm remotememory.RemoteMemory, descriptor libpf.Add
 				return false, nil
 			}
 			allocation = base
-			for name, addressRange := range ranges {
-				found[name] = addressRange
-			}
+			maps.Copy(found, ranges)
 			return true, nil
 		})
 		if err == nil {
@@ -207,7 +206,7 @@ func otp25ModuleRanges(rm remotememory.RemoteMemory, blobAddr libpf.Address, siz
 	found := make(map[string]otp25JITRange, len(wanted))
 	rangeOffset := uint64(otp25DebugInfoSize) + uint64(binary.LittleEndian.Uint16(header[24:26]))
 	rangeCount := uint64(binary.LittleEndian.Uint32(header[16:20]))
-	for i := uint64(0); i < rangeCount; i++ {
+	for range rangeCount {
 		var record [otp25RangeSize]byte
 		if err := otp25ReadBlob(rm, blobAddr, size, rangeOffset, record[:]); err != nil {
 			return otp25JITRange{}, nil, false, fmt.Errorf("read JIT range: %w", err)
@@ -243,7 +242,7 @@ func otp25ModuleRanges(rm remotememory.RemoteMemory, blobAddr libpf.Address, siz
 		if lineCount > (size-rangeOffset)/12 {
 			return otp25JITRange{}, nil, false, fmt.Errorf("JIT range line count exceeds blob size")
 		}
-		for j := uint64(0); j < lineCount; j++ {
+		for range lineCount {
 			var line [12]byte
 			if err := otp25ReadBlob(rm, blobAddr, size, rangeOffset, line[:]); err != nil {
 				return otp25JITRange{}, nil, false, err
