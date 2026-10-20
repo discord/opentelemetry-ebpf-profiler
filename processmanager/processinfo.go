@@ -189,11 +189,6 @@ func (pm *ProcessManager) updatePIDAnonymousMappingInterest(pid libpf.PID, enabl
 // process manager to attach to the process/memory mapping if it is discovered that the
 // memory mapping corresponds with an interpreter.
 //
-// It is important to note that this function may spawn a new goroutine in order to retry
-// attaching to the interpreter, if the first attach attempt fails. In this case, `nil` will still
-// be returned and thus a `nil` return value does not mean the attach was successful. It means
-// that the attach was successful OR a retry is underway.
-//
 // The caller is responsible to hold the ProcessManager lock to avoid race conditions.
 // Returns the updated anonymous executable mapping interest state for the PID.
 func (pm *ProcessManager) handleNewInterpreter(pr process.Process, bias libpf.Address,
@@ -393,9 +388,14 @@ func (pm *ProcessManager) processRemovedInterpreters(pid libpf.PID,
 
 var errInvalidVirtualAddress = errors.New("invalid ELF virtual address")
 
+// newFrameMapping builds a native frame mapping and attempts to attach any
+// interpreter identified in its executable. The returned interpreter.Data is
+// non-nil only if attachment fails; the caller retains it for a later retry.
+// Successful attachments are stored in pm.interpreters and return nil data.
+// An attachment failure still returns a valid frame mapping and a nil error.
 func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapping,
 	anonymousMappingsWanted bool,
-) (libpf.FrameMapping, bool, error) {
+) (libpf.FrameMapping, interpreter.Data, bool, error) {
 	// Open the mapping's own file via OpenMappingFile, which can open deleted
 	// or replaced files (e.g. via /proc/<pid>/map_files) and VDSO from process
 	// memory. Auxiliary opens such as .gnu_debuglink targets go through the
@@ -419,14 +419,14 @@ func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapp
 			log.Debugf("Failed to get ELF info for PID %d file %v: %v",
 				pr.PID(), m.Path, info.err)
 		}
-		return libpf.FrameMapping{}, anonymousMappingsWanted, info.err
+		return libpf.FrameMapping{}, nil, anonymousMappingsWanted, info.err
 	}
 
 	elfSpaceVA, ok := info.addressMapper.FileOffsetToVirtualAddress(m.FileOffset)
 	if !ok {
 		log.Debugf("Failed to map file offset of PID %d, file %s, offset %d",
 			pr.PID(), m.Path, m.FileOffset)
-		return libpf.FrameMapping{}, anonymousMappingsWanted, errInvalidVirtualAddress
+		return libpf.FrameMapping{}, nil, anonymousMappingsWanted, errInvalidVirtualAddress
 	}
 
 	fileID := host.FileIDFromLibpf(info.mappingFile.Value().FileID)
@@ -439,9 +439,10 @@ func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapp
 		// ErrDeferredFileID is expected while this fileID is in backoff. The
 		// original failure was already logged once when the fileID entered
 		// deferredFileIDs.
-		return libpf.FrameMapping{}, anonymousMappingsWanted, err
+		return libpf.FrameMapping{}, nil, anonymousMappingsWanted, err
 	}
 
+	var pendingInterpreter interpreter.Data
 	pm.mu.Lock()
 	pm.assignLibcInfo(pr.PID(), ei.LibcInfo)
 	if ei.Data != nil {
@@ -451,6 +452,7 @@ func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapp
 		); err != nil {
 			log.Errorf("Failed to handle new interpreter for PID %d file %v: %v",
 				pr.PID(), m.Path, err)
+			pendingInterpreter = ei.Data
 		} else {
 			anonymousMappingsWanted = updatedAnonymousMappingsWanted
 		}
@@ -463,7 +465,7 @@ func (pm *ProcessManager) newFrameMapping(pr process.Process, m *process.RawMapp
 		Start:      libpf.Address(elfSpaceVA),
 		End:        libpf.Address(elfSpaceVA + m.Length),
 		FileOffset: m.FileOffset,
-	}), anonymousMappingsWanted, nil
+	}), pendingInterpreter, anonymousMappingsWanted, nil
 }
 
 func compareMapping(a, b Mapping) int {
@@ -701,10 +703,12 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 
 		if mappingNeeded {
 			var fm libpf.FrameMapping
+			var pendingInterpreter interpreter.Data
 			if oldm, ok := mpRemove[m.Vaddr]; ok {
 				if oldm.Length == m.Length && oldm.Device == m.Device && oldm.Inode == m.Inode {
 					delete(mpRemove, m.Vaddr)
 					fm = oldm.FrameMapping
+					pendingInterpreter = oldm.PendingInterpreter
 				}
 			}
 			newMapping := false
@@ -713,10 +717,29 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 				// Error is expected for non-ELF files (e.g. PE DLL);
 				// fm will be invalid and the mapping skipped below but will enter the interpreter mappings block.
 				previouslyCollectingInterpreterMappings := collectAnonymousMappings
-				fm, collectAnonymousMappings, _ = pm.newFrameMapping(
+				fm, pendingInterpreter, collectAnonymousMappings, _ = pm.newFrameMapping(
 					pr, &m, collectAnonymousMappings)
 				if !previouslyCollectingInterpreterMappings && collectAnonymousMappings {
 					interpreterMappings.enable()
+				}
+			} else if pendingInterpreter != nil {
+				// The mapping may have been cached before the runtime finished
+				// initializing. Retry attachment without reloading its unwind data.
+				previouslyCollectingInterpreterMappings := collectAnonymousMappings
+				pm.mu.Lock()
+				updated, err := pm.handleNewInterpreter(pr,
+					libpf.Address(m.Vaddr)-fm.Value().Start,
+					m.GetOnDiskFileIdentifier(), pendingInterpreter, collectAnonymousMappings)
+				pm.mu.Unlock()
+				if err != nil {
+					log.Debugf("Failed to retry interpreter attachment for PID %d file %v: %v",
+						pid, m.Path, err)
+				} else {
+					pendingInterpreter = nil
+					collectAnonymousMappings = updated
+					if !previouslyCollectingInterpreterMappings && collectAnonymousMappings {
+						interpreterMappings.enable()
+					}
 				}
 			}
 			if fm.Valid() {
@@ -724,11 +747,12 @@ func (pm *ProcessManager) SynchronizeProcess(pr process.Process) {
 				interpretersValid[key] = libpf.Void{}
 
 				mappings = append(mappings, Mapping{
-					Vaddr:        libpf.Address(m.Vaddr),
-					Length:       m.Length,
-					Device:       m.Device,
-					Inode:        m.Inode,
-					FrameMapping: fm,
+					Vaddr:              libpf.Address(m.Vaddr),
+					Length:             m.Length,
+					Device:             m.Device,
+					Inode:              m.Inode,
+					FrameMapping:       fm,
+					PendingInterpreter: pendingInterpreter,
 				})
 				if newMapping {
 					mpAdd = append(mpAdd, &mappings[len(mappings)-1])
